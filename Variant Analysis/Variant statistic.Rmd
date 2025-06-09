@@ -1,0 +1,755 @@
+---
+title: "Variant_statistic"
+author: "Xinmeng Liao"
+date: "2024-09-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(xlsx)
+library(ggrepel)
+library(jsonlite)
+library(tidyr)
+library(tidyverse)
+library(RColorBrewer)
+library(stringr)
+library(stringdist)
+library(colorRamp2)
+library(patchwork)
+library(data.table)
+
+genedb = read.csv("Genedb1213.txt",header = T,sep = "\t")
+
+```
+
+# Supplementary Figure 2A
+```{r}
+data <- fread("AF-bi2.frq",sep = "\t",header = F) %>% unique()
+variant <- fread("combine.txt",header = T, sep = "\t")
+## AF counting 
+novel_af <- fread("novel_af.txt",header = T,sep = "\t")
+known_af <- fread("known_af.txt",header = T, sep = "\t")
+type1 <- fread("type.txt",header = T,sep = "\t")
+
+figurek <- known_af %>% dplyr::left_join(., type1, by = "info") %>% 
+  group_by(define, type) %>% summarise(count = n()) %>% 
+  mutate(type = case_when(type == "insertion" ~"INS", type == "deletion"~ "DEL", TRUE ~ type)) %>% 
+  mutate(log = count/(10^7))
+
+figurek$define <- factor(figurek$define, 
+                        levels = c('AC=1','AC=2','AC=3','3<AC,AF<=0.01','0.01<AF<=0.05',
+                                   '0.05<AF<=0.1','0.1<AF<=0.15','0.15<AF<=0.2','0.2<AF<=0.25',
+                        '0.25<AF<=0.3','0.3<AF<=0.35','0.35<AF<=0.4','0.4<AF<=0.45',
+                        '0.45<AF<=0.5','0.5<AF<=0.55','0.55<AF<=0.6',
+                        '0.6<AF<=0.65','0.65<AF<=0.7','0.7<AF<=0.75','0.75<AF<=0.8',
+                        '0.8<AF<=0.85','0.85<AF<=0.9','0.9<AF<=0.95','0.95<AF<=1'))
+figurek$Group <-  "Known variants"
+
+
+figuren <- novel_af %>% dplyr::left_join(., type1, by = "info") %>% 
+  group_by(define, type) %>% summarise(count = n()) %>% 
+  mutate(type = case_when(type == "insertion" ~"INS", type == "deletion"~ "DEL", TRUE ~ type)) %>% 
+  mutate(log = count/(10^7))
+figuren$define <- factor(figuren$define, 
+                        levels = c('AC=1','AC=2','AC=3','3<AC,AF<=0.01','0.01<AF<=0.05',
+                                   '0.05<AF<=0.1','0.1<AF<=0.15','0.15<AF<=0.2','0.2<AF<=0.25',
+                                   '0.25<AF<=0.3','0.3<AF<=0.35','0.35<AF<=0.4','0.4<AF<=0.45',
+                                   '0.45<AF<=0.5','0.5<AF<=0.55','0.55<AF<=0.6',
+                                   '0.6<AF<=0.65','0.65<AF<=0.7','0.7<AF<=0.75','0.75<AF<=0.8',
+                                   '0.8<AF<=0.85','0.85<AF<=0.9','0.9<AF<=0.95','0.95<AF<=1'))
+figuren$Group <- "Novel variants"
+
+figure_all <- rbind(figuren, figurek)
+figure_all$Group <- factor(figure_all$Group,levels = c("Known variants","Novel variants"))
+
+p <- ggplot(data = figure_all, aes(x = log , y = define, fill = type))+
+  geom_bar(position = "stack",stat = 'identity')+
+  theme_classic()+
+  labs(x = NULL, y = NULL,fill = "Type",
+       title = expression("No. of variant (" * 10^6 * ")"))+
+  facet_grid(. ~ Group)+
+  theme(legend.position = "right")+
+  theme(legend.key.size = unit(0.5, "cm"))+
+  scale_fill_manual(values = c("SNV" = "#3A63C5",   
+                               "INS" = "#C53A63", 
+                               "DEL" = "#63C53A")) +
+  theme(axis.text.y = element_text(size=13,family = "Helvetica",colour = "black"),
+        axis.text.x = element_text(size=13, family = "Helvetica",colour = "black"),
+        legend.title = element_text(size = 15, family = "Helvetica",colour = "black"),
+        legend.text = element_text(size = 15, family = "Helvetica",colour = "black"),
+        title = element_text(size = 13, family = "Helvetica",colour = "black"))+
+  theme(strip.background = element_rect(fill = "#DCDCDC"),
+        strip.text = element_text(size = 15, color = "black",family = "Helvetica"),panel.grid.major.x = element_blank()) 
+
+```
+
+# Supplementary Figure 2B
+```{r}
+
+## Variants number and novel variant rate
+conseq <- read.csv("conseq.txt",header = T,sep = "\t")
+conseq$conseq <- sapply(strsplit(as.character(conseq$conseq), split = "&"), function(x) x[1])
+figure <- conseq %>% 
+  mutate(conseq = case_when(grepl("splice",conseq)~"Splicing",
+                            grepl("synonymous_variant",conseq) ~ "Exonic",
+                            grepl("missense_variant",conseq) ~ "Exonic",
+                            grepl("stop_lost",conseq) ~ "Exonic",
+                            grepl("inframe_insertion",conseq) ~ "Exonic",
+                            grepl("stop_retained_variant",conseq) ~ "Exonic",
+                            grepl("inframe_deletion",conseq) ~ "Exonic",
+                            grepl("stop_gained",conseq) ~ "Exonic",
+                            grepl("frameshift_variant",conseq) ~ "Exonic",
+                            grepl("coding_sequence_variant",conseq) ~ "Exonic",
+                            grepl("protein_altering_variant", conseq) ~ "Exonic",
+                            TRUE~conseq)) %>% 
+  mutate(conseq = case_when(conseq == "3_prime_utr_variant" ~ "3UTR", 
+                            conseq == "5_prime_utr_variant" ~ "5UTR", 
+                            conseq == "start_lost" ~ "Exonic",
+                            conseq == "start_retained_variant" ~ "Exonic",
+                            conseq == "downstream_gene_variant" ~ "Downstream", 
+                            conseq == "upstream_gene_variant"  ~ "Upstream",
+                            conseq == "intergenic_variant" ~ "Intergenic", 
+                            conseq == "non_coding_transcript_exon_variant" ~ "Exonic",
+                            conseq == "intron_variant" ~ "Intron", TRUE ~ conseq))%>% 
+  mutate(type = case_when(type == "deletion" ~ "DEL", 
+                          type == "insertion" ~ "INS", 
+                          TRUE ~ "SNV"))
+
+
+
+figure1 <- figure %>% 
+  group_by(conseq, existing, type) %>% summarise(final = sum(count),.groups = "drop") %>% 
+  group_by(conseq,type) %>% summarise(total = sum(final),.groups = "drop") %>% 
+  mutate(log = total / 1000000) 
+
+figure1$conseq <- factor(figure1$conseq, levels = c("Exonic","Upstream","Downstream","3UTR","5UTR","Splicing","ncRNA_exonic","Intergenic","Intron"))
+
+p1 <- ggplot(figure1, aes(x = conseq, y = log,fill = type)) +
+  geom_bar(stat = "identity",position = 'stack',width = 0.85)+
+  scale_fill_manual(values = c("SNV" = "#3A63C5",
+                               "INS" = "#C53A63",
+                               "DEL" = "#63C53A")) +
+  labs(y = expression("No. of variant (" * 10^6 * ")"), x = NULL)+
+  theme_classic()+
+  theme(legend.position = "none") +
+  scale_y_continuous(breaks = seq(0,45,5))+
+  theme(axis.title.y = element_text(size=20, family = "Helvetica",colour = "black"),
+        axis.text.y = element_text(size=15, family = "Helvetica",colour = "black"),
+        axis.text.x = element_text(size=0, family = "Helvetica",colour = "black"))
+
+
+figure2 <- figure %>% 
+  group_by(conseq, existing) %>% summarise(final = sum(count)) %>% ungroup() %>% 
+  group_by(conseq) %>% summarise(total = sum(final), novel = sum(final[existing == "Novel"]),.groups = "drop") %>% 
+  mutate(rate = (novel/total)) 
+figure2$conseq <- factor(figure2$conseq, levels = c("Exonic","Upstream","Downstream","3UTR","5UTR","Splicing","ncRNA_exonic","Intergenic","Intron"))
+
+p2 <- ggplot(figure2, aes(x = conseq, y = rate, group = 1))+
+  geom_point(alpha = 0.8, color = "darkgrey", size = 2)+
+  geom_line(color = "grey", linewidth = 0.8, alpha = 1)+
+  theme_classic()+
+  scale_y_continuous(breaks = seq(0.15,0.25,0.02))+
+  labs(y = "Novel rate", x = NULL)+
+  theme(axis.title.y = element_text(size=20, family = "Helvetica",colour = "black"),
+        axis.text.y = element_text(size=15, family = "Helvetica",colour = "black"),
+        axis.text.x = element_text(size=13, family = "Helvetica",colour = "black", angle = 45,hjust = 1))
+
+
+p1/p2 + plot_layout(heights = c(2, 1))
+
+
+exonic <- conseq %>% 
+  mutate(exonic = case_when(grepl("synonymous_variant",conseq) ~ "Exonic",
+                            grepl("missense_variant",conseq) ~ "Exonic",
+                            grepl("stop_lost",conseq) ~ "Exonic",
+                            grepl("inframe_insertion",conseq) ~ "Exonic",
+                            grepl("stop_retained_variant",conseq) ~ "Exonic",
+                            grepl("inframe_deletion",conseq) ~ "Exonic",
+                            grepl("stop_gained",conseq) ~ "Exonic",
+                            grepl("frameshift_variant",conseq) ~ "Exonic",
+                            grepl("coding_sequence_variant",conseq) ~ "Exonic",
+                            grepl("protein_altering_variant", conseq) ~ "Exonic",
+                            conseq == "start_lost" ~ "Exonic",
+                            conseq == "start_retained_variant" ~ "Exonic",
+                            conseq == "non_coding_transcript_exon_variant" ~ "Exonic",
+                            TRUE ~ conseq))%>% 
+  mutate(type = case_when(type == "deletion" ~ "DEL", 
+                        type == "insertion" ~ "INS", 
+                        TRUE ~ "SNV")) %>% 
+  filter(exonic == "Exonic") %>% 
+  group_by(conseq) %>% 
+  summarise(total = sum(count),.groups = "drop") %>% 
+  mutate(conseq = gsub("_"," ",conseq))
+exonic$conseq[6] <- "non coding transcript\nexon variant"
+
+p1 <- ggplot(exonic, aes(x = "", y = total , fill = conseq))+
+  geom_col()+
+  coord_polar(theta = "y",start = 5) + 
+  scale_fill_manual(values = c("#fc8d62", "#fdaf8e", "#e06b45", "#8da0cb", "#6a8ac4", "#4769a5", "#b3c3e5",
+                             
+                             "#F2CC5A", "#F8E3A1", "#E6B92E",
+                             "#66c2a5", "#99d8c9", "#3aa98c"))+
+  labs(fill = "Types", title = "Structural variation types") +
+  theme_void() +
+  theme(
+    legend.title = element_text(size = 14,family = "Helvetica",colour = "black"),
+    legend.text = element_text(size = 12,family = "Helvetica",colour = "black"),
+    plot.title = element_text(size = 0, family = "Helvetica",colour = "black",hjust = 0.5)
+  )
+
+
+```
+
+
+# Extract the HC-LoF for TR adult and newborn
+```{r}
+# TR Healthy Cohort 
+files <- list.files("HC_HealthyAdult_0822")
+
+data <- data.frame()
+
+for ( i in files){
+  print(i)
+  df <- read.csv(paste0("HC_HealthyAdult_0822/", i), header = F,sep = "\t")
+  colnames(df) <- c("chr","pos","ID","Ref","Alt","QUAL","FILTER","INFO","TITLE","Last")
+  df$Sample <- unlist(strsplit(i,split = "_HC"))[1]
+  df <- df %>% mutate(AC = sapply(strsplit(split = ";",INFO),`[`,1)) %>% 
+    filter(chr != "chrM") %>% 
+    select(Sample, chr, pos, Ref, Alt, AC)
+  data <- rbind(data, df)
+  
+}
+
+index <- grep(",",data$Alt)
+multi <- data[index,]
+
+
+# TR Newborn
+files <- list.files("HC_Newborn_0822/")
+
+data <- data.frame()
+
+for ( i in files){
+  print(i)
+  df <- read.csv(paste0("HC_Newborn_0822/", i), header = F,sep = "\t")
+  colnames(df) <- c("chr","pos","ID","Ref","Alt","QUAL","FILTER","INFO","TITLE","Last")
+  df$Sample <- unlist(strsplit(i,split = "_HC"))[1]
+  df <- df %>% mutate(AC = sapply(strsplit(split = ";",INFO),`[`,1)) %>% 
+    filter(chr != "chrM") %>% 
+    select(Sample, chr, pos, Ref, Alt, AC)
+  data <- rbind(data, df)
+  
+}
+
+index <- grep(",",data$Alt)
+multi <- data[index,] 
+index2 <- which(data$Ref == "TAG" & data$Alt == "T,TAGAGAGAG" & data$chr == "chr9")
+data$Alt[index2] <- "TAGAGAGAG"
+data$AC[index2] <- "AC=1"
+data <- unique(data)
+
+```
+
+
+# HC-LoF comparing with TR Virome and TR Healthy Cohort
+```{r}
+# TR Virome
+common <- read.xlsx("TR common homo HC-LoFs.xlsx",sheetIndex = 1,startRow = 2) %>% 
+  slice(1:307) %>% select(1:38) %>% mutate(Chr = paste("chr",Chr ,sep = "")) %>% 
+  mutate(variant_info = paste(Chr, GRCh38_pos, REF, ALT,sep = "_")) %>% 
+  mutate(variant_info = gsub(" ","",variant_info))
+variome_variant <- unique(common$variant_info)
+
+rare <- read.xlsx("TR rare homo HC-LoF.xlsx",sheetIndex = 1,startRow = 2) %>% select(1:42) %>% slice(1:704) %>% filter(GRCh38_pos != ".") %>% 
+  mutate(Chr = paste("chr",Chr ,sep = "")) %>% 
+  mutate(variant_info = paste(Chr, GRCh38_pos, REF, ALT,sep = "_")) %>% 
+  mutate(variant_info = gsub(" ","",variant_info))
+rare_variant <- unique(rare$variant_info)
+
+df <- rare %>% select(Chr,GRCh38_pos,REF,ALT) %>% mutate(Chr = paste("chr",Chr,sep = "")) 
+
+hclof <- function(data){
+  index <- grep(",",data$Alt)
+  multi <- data[index,] 
+  
+  multi1 <- data[index,] %>% 
+  separate_rows(Alt, sep = ",") %>% 
+  mutate(AC = 1) 
+  
+  final <- data[-index, ] %>% 
+  mutate(AC = gsub("AC=","",AC)) %>% 
+  rbind(., multi1) %>% 
+  mutate(chr = gsub(" ","",chr),
+         pos = gsub(" ","",pos),
+         Ref = gsub(" ","",Ref),
+         Alt = gsub(" ","",Alt)) %>% 
+  mutate(variant_info = paste(chr, pos, Ref, Alt,sep = "_")) %>% 
+  mutate(AC = as.numeric(AC))
+  return(list(multi = multi, final = final))
+}
+
+
+# TR healthy adult
+adult <- read.table("adult_HC-LoF.txt",header = T,sep = "\t")
+adult1 <- hclof(adult)
+multi <- adult1$multi
+final <- adult1$final
+class(final$AC)
+
+hom_variants <- final %>% 
+  filter(AC == 2) %>% select(variant_info) %>% unique()
+
+adult_hclof_all <- final %>% 
+  filter(variant_info %in% hom_variants$variant_info) %>% 
+  select(Sample, variant_info, AC) %>% unique() %>% 
+  group_by(variant_info) %>% summarise(count = sum(AC),.groups = "drop") %>% 
+  mutate(AF = count/ (272 *2))
+adult_common_hom <- adult_hclof_all %>% filter(AF > 0.01)
+adult_rare_hom <- adult_hclof_all %>% filter(AF <= 0.01)
+
+# TR newborn
+newborn <- read.table("newborn_HC-LoF.txt",header = T,sep = "\t")
+
+newborn1 <- hclof(newborn)
+multi <- newborn1$multi
+final <- newborn1$final
+class(final$AC)
+
+hom_variants <- final %>% 
+  filter(AC == 2) %>% select(variant_info) %>% unique()
+
+newborn_hclof_all <- final %>% 
+  #filter(AC == 2)  %>% 
+  filter(variant_info %in% hom_variants$variant_info) %>% 
+  select(Sample, variant_info, AC) %>% unique() %>% 
+  group_by(variant_info) %>% summarise(count = sum(AC),.groups = "drop") %>% 
+  mutate(AF = count/ (1100 *2))
+newborn_common_hom <- newborn_hclof_all %>% filter(AF > 0.01)
+newborn_rare_hom <- newborn_hclof_all %>% filter(AF <= 0.01)
+
+```
+
+# Supplementary Figure 1A=B
+```{r}
+library(VennDiagram)
+library(RColorBrewer)
+library(venn)
+library(grid)
+myCol <- brewer.pal(3, "Pastel2")
+myCol <- brewer.pal(3, "Set3")
+
+
+# datasets
+common_Variome <- read.table("TR_Variome_common.txt",
+                      header = T,sep = "\t") 
+common_TR_Adult <- read.table("common_adult_common_homHCLof2.txt"  ,header = T,sep = "\t") %>% unique() 
+common_newborn <- read.table("common_newborn_common_homHCLof2.txt",header = T,sep = "\t") %>% unique()
+
+rare_Variome <- read.table("TR_Variome_rare.txt",
+                           header = T,sep = "\t")
+rare_TR_adult <- read.table("common_adult_rare_homHCLof2.txt",header = T,sep = "\t") %>% unique()
+rare_newborn <- read.table("common_newborn_rare_homHCLof2.txt",header = T,sep = "\t") %>% unique()
+
+
+# Common HC-LoFs Venn
+venn.diagram(
+  x = list(unique(common_Variome$variant_info),
+           unique(common_TR_Adult$variant_info),
+           unique(common_newborn$variant_info)),
+  category.names = c("" , "", "" ),
+  filename = "venn_common2.png",
+  main = "Common homozygous LoF variants",
+  main.cex = 1, # font size
+  main.fontface = "bold",
+  main.fontfamily = "Helvetica",
+  output=NULL,
+  scaled = F, 
+  lwd = 2,
+  
+  imagetype="png" ,
+  units = "cm",
+  height = 15 , 
+  width = 15 , 
+  resolution = 300,
+  compression = "lzw",
+        
+  lty = 'blank',
+  fill = myCol,
+        
+  cex = 2,
+  fontfamily = "Helvetica",
+)
+
+# Rare HC-LoFs Venn
+venn.diagram(
+  x = list(rare_Variome$variant_info,
+           unique(rare_TR_adult$variant_info),
+           unique(rare_newborn$variant_info)),
+  category.names = c("Variome" , "TR Adult", "TR Newborn" ),
+  filename = "venn_rare2.png",
+  main = "Rare homozygous LoF variants",
+  main.cex = 1, # font size
+  main.fontface = "bold",
+  main.fontfamily = "Helvetica",
+  output=NULL,
+  
+  imagetype="png" ,
+  units = "cm",
+  height = 15 , 
+  width = 15 , 
+  resolution = 300,
+  compression = "lzw",
+        
+  lwd = 1,
+  lty = 'blank',
+  fill = myCol,
+        
+  cex = 2,
+  fontfamily = "Helvetica",
+)
+
+sets = list(
+  "TR Variome" = unique(common_Variome$variant_info),
+  "TR Healthy Adult" = unique(common_TR_Adult$variant_info),
+  "TR Newborn" = unique(common_newborn$variant_info)
+)
+
+
+```
+
+# Inhouse Turkish Healthy Adult Analysis
+```{r}
+healthy <- read.csv("merge_TR_adult_corhort(all)_0822.csv",header = T,sep = ",")
+
+adult_healthy <-  healthy %>% 
+  mutate(MAX_AF_ALL = apply(select(., c(71:89, 138:145)), 1, function(x) max(replace(x, is.na(x), 0)))) %>% 
+  filter(!grepl("Conflicting_classifications_of_pathogenicity",ClinVar_CLNSIG) & ClinVar_CLNSIG != "")  %>% 
+  filter(MAX_AF_ALL < 0.05 | is.na(MAX_AF_ALL)) %>% 
+  mutate(tmp_filter = if_else(
+   (grepl("ClinP_LP_var", Database_type) & ClinVar_ReviewStar < 2), "exclude", "keep")) %>%
+  filter(tmp_filter == "keep") %>%
+  mutate(Database_type = if_else(ClinVar_CLNSIG == "HGMD","HGMD",Database_type)) %>% 
+  filter(Target.group == "Newborn-screening" | Target.group == "Health predipositions/Disease risk") %>% 
+  filter(!is.na(Mark)) %>% 
+  select('Sample',"Gender","SZAID",'Database_type','SZAdiseaseID','Gene','Genes','SZAreportCategory','Zygosity','Genotype',
+         Compound_heterozygous,'Gene.Disease.confidence.level',"IMPACT","ClinVar_CLNSIG",'Database_type',
+         Gene.Disease.confidence.level,Target.group,'Disease',"ClinVar_CLNDN","Consequence",
+         'X.CHROM','POS','REF','ALT',"Variant_info",'Mark',Inheritance,LoF,
+         'Compound_heterozygous','P0064_WGS','Allele','MAX_AF',MAX_AF_ALL,
+         'HGVSp','HGVSc','Existing_variation','VARIANT_CLASS') %>% 
+  left_join(.,hgmd[,c("variant_info","Variant.class")], by = c("Variant_info" = "variant_info")) %>% unique()
+
+unique(adult_healthy$Target.group)
+
+
+data = adult_healthy
+unique(data$Zygosity)
+unique(data$Inheritance)
+
+## Childhood onset: Newborn, Autosomal dominant, Autosomal recessive (homozygous), Male-XLD/XLR
+adult_child = data %>% 
+  filter(Target.group == "Newborn-screening") %>% 
+    filter(
+      Inheritance == "AD" | 
+      Inheritance == "XLD" | 
+      Inheritance == "X-linked multiple and/or complex pattern" | 
+      Inheritance == "Multiple and/or complex pattern" | 
+      Inheritance == "AR; AD" | 
+      (Inheritance == "AR" & Zygosity == "Homozygous")|
+      (Gender == "Female" & Inheritance == "XLR" & Zygosity == "Homozygous") |
+      (Gender == "Male" & Inheritance == "XLR" & Zygosity == "Hemizygous")) 
+
+unique(adult_child$Target.group) #"Newborn-screening"
+
+## Adulthood onset: Health, Autosomal dominant, Autosomal recessive (homozygous), Male-XLD/XLR
+adult_adult = data %>% 
+  filter(Target.group == "Health predipositions/Disease risk") %>% 
+    filter(Inheritance == "AD" | 
+           Inheritance == "XLD" |
+           Inheritance == "X-linked multiple and/or complex pattern" | 
+           Inheritance == "Multiple and/or complex pattern" | 
+           Inheritance == "AR; AD" | 
+      (Inheritance == "AR" & Zygosity == "Homozygous")|
+      (Gender == "Female" & Inheritance == "XLR" & Zygosity == "Homozygous") |
+      (Gender == "Male" & Inheritance == "XLR" & Zygosity == "Hemizygous"))
+
+unique(adult_adult$Target.group)
+
+## Carrier status: Autosomal recessive (heterzygous), Female-XLR (heterzygous)
+adult_carrier = data %>% 
+  filter(Target.group == "Newborn-screening") %>% 
+  filter(Zygosity == "Heterozygous") %>% 
+  filter(Inheritance %in% c("X-linked multiple and/or complex pattern","AR","XLR","AR; AD",
+                             "Multiple and/or complex pattern"))
+
+unique(adult_carrier$Target.group) #"Newborn-screening"
+
+input = adult_child %>% unique()
+
+count <- input %>% 
+  filter(MAX_AF_ALL < 0.01 | is.na(MAX_AF_ALL)) %>% 
+  filter(SZAreportCategory > 7) %>% 
+  filter(ClinVar_CLNSIG != "" & !grepl("Conflicting_interpretations_of_pathogenicity", ClinVar_CLNSIG)) %>% 
+  select(Sample, Gender, Genes,Variant_info,X.CHROM,POS,REF,ALT,Consequence, 
+         HGVSc,HGVSp,Zygosity,IMPACT,ClinVar_CLNSIG,Disease,Inheritance, LoF) %>% 
+  mutate(Genotype = case_when(
+    Zygosity == "Heterozygous" ~ paste0(REF,"/",REF,">",REF, "/",ALT),
+    Zygosity == "Hemizygous" ~ paste0(REF,"/",REF,">",REF, "/",ALT),
+    Zygosity == "Homozygous" ~ paste0(REF,"/",REF,">",ALT, "/",ALT)
+    ) ) %>% 
+  mutate(LoF = if_else(LoF == "", NA,LoF)) %>% 
+  distinct() 
+gender = count %>% select("Sample", "Gender","Genes", "Variant_info") %>% rename(Gene = Genes)
+
+length(unique(count$Sample)) 
+
+count1 <- count %>% 
+  group_by(Genes, Variant_info,Genotype, HGVSc,HGVSp,Zygosity,IMPACT,ClinVar_CLNSIG,LoF, Consequence) %>% 
+  summarise(Unique_sample = n_distinct(Sample),.groups = "drop") %>% 
+  mutate("Variants Carrier Frequency" = Unique_sample/272) %>% 
+  ungroup() %>% 
+  group_by(Genes) %>%
+  mutate(Total_Unique_Samples = sum(Unique_sample)) %>% 
+  ungroup() %>% 
+  mutate(Total_carrier_frequency = Total_Unique_Samples / 272 ) %>% 
+  arrange(desc(Total_carrier_frequency),desc(Unique_sample)) %>% 
+  distinct() %>% 
+  left_join(., input[,c("Genes","Variant_info","Disease","Inheritance","MAX_AF_ALL","Zygosity","SZAreportCategory")], 
+            by = c("Genes" = "Genes","Variant_info" = "Variant_info", "Zygosity" = "Zygosity")) %>% 
+  distinct() %>% 
+  filter(SZAreportCategory > 7) %>% select(-SZAreportCategory) %>% unique() %>% 
+  rename("No. of sample for gene" = Total_Unique_Samples,
+         "No. of sample for variant" = Unique_sample,
+         "Variant carrier frequency" = `Variants Carrier Frequency`,
+         "Gene carreir frequency"  = Total_carrier_frequency)
+
+
+final.data.manage <- function(data){
+  final <- data %>% 
+    ungroup() %>% 
+    mutate(Zygosity = case_when(Zygosity == "Homozygous"~"Hom",
+                                Zygosity == "Heterozygous"~ "Het",
+                                TRUE ~ Zygosity)) %>% 
+    mutate(ClinVar_CLNSIG = case_when(ClinVar_CLNSIG == "Pathogenic" ~ "P",
+                                     ClinVar_CLNSIG == "Pathogenic/Likely_pathogenic/Pathogenic&_low_penetrance" ~ "P/LP",
+                                     ClinVar_CLNSIG == "Pathogenic&drug_response" ~ "P",
+                                     ClinVar_CLNSIG == "Pathogenic&risk_factor" ~ "P",
+                                     ClinVar_CLNSIG == "Pathogenic/Likely_pathogenic&risk_factor" ~ "P/LP",
+                                     ClinVar_CLNSIG == "Pathogenic/Likely_pathogenic&other" ~ "P/LP",
+                                     ClinVar_CLNSIG == "Likely_pathogenic" ~ "LP",
+                                     ClinVar_CLNSIG == "Likely_pathogenic&drug_response" ~ "LP",
+                                     ClinVar_CLNSIG == "Pathogenic/Likely_pathogenic" ~"P/LP",
+                                     ClinVar_CLNSIG == "Pathogenic,DM" ~ "P, DM", 
+                                     ClinVar_CLNSIG == "Pathogenic/Likely_pathogenic,DM" ~ "P/LP, DM",
+                                     ClinVar_CLNSIG == "Likely_pathogenic,DM" ~ "LP, DM",
+                                     ClinVar_CLNSIG == "DM" ~ "DM",ClinVar_CLNSIG == "DM?" ~ "DM?",
+                                     TRUE ~  "/")) %>% 
+    mutate(HGVSc = sapply(strsplit(HGVSc, ":"), `[`, 2)) %>% 
+    mutate(HGVSp = sapply(strsplit(HGVSp, ":"), `[`, 2)) %>% 
+    mutate(HGVSp= replace_na(HGVSp, "/")) %>% 
+    rename(Variation = HGVSc) %>%
+    rename(Inh = Inheritance) %>% 
+    rename(Pathogenicity = ClinVar_CLNSIG) %>% 
+    select(Disease, Inh, Genes, Genotype,Zygosity,Variation, HGVSp,Pathogenicity,IMPACT,Consequence,LoF,`No. of sample for variant`,
+           `Variant carrier frequency`, `No. of sample for gene`,`Gene carreir frequency`,  MAX_AF_ALL,Variant_info) %>% 
+    mutate(MAX_AF_ALL = if_else(MAX_AF_ALL == 0, NA, MAX_AF_ALL))
+
+return(final)
+}
+
+final <- final.data.manage(count1)
+
+final1 <- final %>% 
+  group_by(Inh,Genes,Genotype,Zygosity,Variation,HGVSp,Pathogenicity,IMPACT,Consequence, LoF,
+           `No. of sample for variant`,`Variant carrier frequency`,`No. of sample for gene`,
+           `Gene carreir frequency`,MAX_AF_ALL,Variant_info) %>% 
+  mutate(Disease = paste(Disease, collapse = ", ")) %>% ungroup() %>% unique() %>% arrange(desc(`No. of sample for gene`),Genes,desc(`No. of sample for variant`),Disease)
+
+length(unique(final1$Disease))
+
+vaf <- final1 %>% group_by(Variant_info) %>% 
+  summarise(`No. of sample for variant_info` = sum(`No. of sample for variant`)) %>% 
+  mutate(`Vairant_info carreir frequency` = `No. of sample for variant_info` / 272)
+  
+final1 <- final1 %>% left_join(., vaf, by = "Variant_info")
+
+```
+
+
+# Supplementary Figure 2D
+```{r}
+library(vcfR)
+library(stringr)
+clinvar <- read.vcfR("clinvar_20240611.vcf.gz")
+clinvar <- clinvar@fix %>% as.data.frame() %>% mutate(CLNSIG = str_extract(INFO, "CLNSIG=([^;]+)")) %>% 
+  mutate(info = paste(CHROM,POS,REF,ALT,sep = "_")) %>% select(info, CLNSIG) %>% 
+  mutate(CLNSIG = gsub("CLNSIG=","",CLNSIG))
+
+lof <- read.vcfR("LoF.vcf")
+lof1 <- lof@fix %>% as.data.frame() %>% 
+  separate_rows(sep = ",",INFO) %>% 
+  mutate(info = paste(CHROM,POS,REF,ALT,sep = "_")) %>% 
+  separate(INFO, into = paste0("INFO", 1:68), sep = "\\|", fill = "right", extra = "warn") %>% 
+  filter(INFO26 == "MANE_Select")
+lof2 <- lof1 %>% mutate(max = apply(lof1[,40:66], 1, max)) %>% 
+  select(info, INFO2, INFO3, max) %>% 
+  filter(INFO3 == "HIGH") %>% 
+  mutate(INFO2 = sapply(strsplit(split = "&",INFO2),`[`, 1)) %>% unique() 
+
+figure1 <- lof2 %>% 
+  mutate(define = case_when(0.05 < max ~ "0.05 < Max_MAF", 
+                            0.01 < max & max <= 0.05 ~ "0.01 < Max_MAF ≤ 0.05",
+                            0 < max &  max <= 0.01 ~ "Max_MAF ≤ 0.01",
+                            max == "" | max == 0 ~ "No Max_MAF", TRUE ~ "Error")) %>% 
+  group_by(INFO2, define) %>% summarise(count = n(),.groups = "drop") %>% 
+  mutate(INFO2 = case_when(INFO2 == "frameshift_variant" ~ "Frameshift", 
+                           INFO2 == "splice_acceptor_variant" ~ "Splice\nacceptor",
+                           INFO2 == "splice_donor_variant" ~ "Splice\nadonor",TRUE ~ INFO2)) %>% 
+  mutate(INFO2 = case_when(INFO2 == "start_lost" ~ "Start\nlost",
+                         INFO2 == "stop_gained" ~ "Stop\ngained",
+                         INFO2 == "stop_lost" ~ "Stop\nlost", TRUE ~ INFO2))
+
+
+figure2 <- lof1 %>% left_join(., clinvar, by = "info") %>% 
+  select(info, INFO2, INFO3, CLNSIG) %>% 
+  filter(INFO3 == "HIGH") %>% 
+  mutate(INFO2 = sapply(strsplit(split = "&",INFO2),`[`, 1)) %>% 
+  mutate(CLNSIG = sapply(strsplit(split = "\\|",CLNSIG),`[`, 1)) %>% unique() %>% 
+  mutate(CLNSIG = case_when(grepl("benign",ignore.case = T,CLNSIG) ~ "B/LB",
+                            CLNSIG == "Pathogenic" ~ "P", 
+                            CLNSIG == "Likely_pathogenic" ~ "LP",
+                            CLNSIG == "Pathogenic/Likely_pathogenic" ~ "P", 
+                            CLNSIG == "Uncertain_significance" ~ "VUS",
+                            CLNSIG == "Conflicting_classifications_of_pathogenicity" ~ "Conflicting",
+                            TRUE ~ "Other")) %>% 
+  group_by(INFO2, CLNSIG) %>% summarise(count = n(),.groups = "drop")
+
+f1 <- ggplot(figure1, aes(x = INFO2, y =count/1000, fill = define))+
+  geom_bar(stat = "identity",width = 0.55)+
+  theme_classic()+
+  scale_fill_manual(values = c("#BCC6DD","#98A3CA","#8092C4","#455D99"))+
+  theme(axis.text.x = element_text(size = 12, family = "Helvetica",colour = "black",angle = 0),
+        axis.title.x = element_text(size = 12, family = "Helvetica",colour = "black"),
+        axis.text.y = element_text(size = 12, family = "Helvetica",colour = "black"),
+        axis.title.y = element_text(size = 15,  family = "Helvetica",colour = "black"))+
+  theme(legend.text = element_text(size = 12, family = "Helvetica",colour = "black"),
+        legend.title = element_text(size = 12,  family = "Helvetica",colour = "black"))+
+  labs(x = NULL, y = expression("No. of Variant (" * 10^3 * ")"))+
+  labs(fill = "Maximum MAF")+
+  scale_y_continuous(breaks = seq(0, 10,1))+
+  theme(legend.position = "right")
+
+figure2$CLNSIG <- factor(figure2$CLNSIG,levels = c("P","LP","Conflicting","VUS","B/LB","Other"))
+figure2 <- figure2 %>% filter(CLNSIG != "Other")
+f2 <- ggplot(figure2, aes(x = INFO2, y = count/100, fill = CLNSIG))+
+  geom_bar(stat = "identity",width = 0.55, position = "fill")+
+  theme_classic()+
+  scale_fill_manual(values = c("#E15759","#F28E2B","#4E79A7", "#AF7AA1", "#59A14F"))+
+  #scale_fill_manual(values = c("#E15759","#F28E2B","#4E79A7", "#AF7AA1", "#BAB0AC", "#59A14F"))+
+  theme(axis.text.x = element_text(size = 0, family = "Helvetica",colour = "black",angle = 0),
+        axis.title.x = element_text(size = 0, family = "Helvetica",colour = "black"),
+        axis.text.y = element_text(size = 12, family = "Helvetica",colour = "black"),
+        axis.title.y = element_text(size = 15,  family = "Helvetica",colour = "black"))+
+  theme(legend.text = element_text(size = 12, family = "Helvetica",colour = "black"),
+        legend.title = element_text(size = 12,  family = "Helvetica",colour = "black"))+
+  labs(x = NULL, y = "Ratio of Pathgenicities")+
+  labs(fill = "Pathogenicity")+
+  scale_y_continuous(breaks = seq(0, 1, 0.25), labels = function(x) paste0((1 - x) * 100, "%")) +
+  #scale_y_reverse()+
+  theme(legend.position = "right")+
+  scale_x_discrete(position = "top") +
+
+  theme(legend.margin = margin(t = 0, r = 0, b = 0, l = -2, unit = "cm"),
+      legend.box.margin = margin(t = 0, r = 0, b = 0, l = 0, unit = "cm"))
+
+(f1/f2)
+
+```
+
+
+# Supplementary Figure 2E
+```{r}
+library(vcfR)
+
+# CNV
+files = list.files("cnv")
+all = data.frame()
+
+
+for (i in files){
+  df <- read.vcfR(paste("cnv",i,sep = "/")) 
+  df1 <- df@fix %>% as.data.frame() %>% 
+    filter(FILTER == "PASS" & !is.na(ALT)) %>% 
+    mutate(pos = sapply(strsplit(split = ":",ID),`[`,4),
+           variant_info = paste(CHROM, pos, sep = "_"),
+           ALT = gsub("<","",ALT),
+           ALT = gsub(">","",ALT),
+           Sample = unlist(strsplit(i, ".cnv"))[1]) %>% unique()
+  all <- rbind(all, df1)
+}
+
+all$type = "CNV"
+
+cnv.num <- all %>% select(ALT, variant_info) %>% unique() 
+
+pie2 <- all.all %>% mutate(new = paste(type, svtype, sep = " ")) %>% 
+  filter(new %in% c("CNV DUP","CNV DEL","SV DUP","SV DEL")) %>% unique() 
+pie2 <- table(pie2$new) %>% as.data.frame()
+pie2$Var1 <- factor(pie2$Var1, levels = c("CNV DEL","SV DEL","CNV DUP","SV DUP"))
+
+p2 <- ggplot(pie2, aes(x = "",y = Freq, fill = Var1))+
+  geom_col()+
+  coord_polar(theta = "y")+
+  scale_fill_manual(values = c("#CED880","#8CCCAB","#21AFD2", "#405F77"))+
+  theme_void()+
+  theme(
+    legend.title = element_text(size = 14,family = "Helvetica",colour = "black"),
+    legend.text = element_text(size = 14,family = "Helvetica",colour = "black"),
+    plot.title = element_text(size = 0, family = "Helvetica",colour = "black",hjust = 0.5),
+  )
+
+
+# For CNV pathogenicity and types 
+cnv <- read.csv("/Volumes/Xinmeng.HD2/sv.management/merge_cnv_all0822.txt",header = T,sep = "\t")
+files = list.files("/Volumes/Xinmeng.HD2/sv.management/cnv_AnnotSV0822")
+all.cnv = data.frame()
+
+for (i in files){
+  print(i)
+  name = unlist(strsplit(i, split = ".cnv"))[1]
+  df = read.csv(paste("/Volumes/Xinmeng.HD2/sv.management/cnv_AnnotSV0822",i,sep = "/"),header = T,sep = "\t")
+  df <- df %>% filter(Annotation_mode == "full" & FILTER == "PASS") 
+  names(df)[which(grepl("P0064_", names(df)))] = "P0064_WGS"
+  all.cnv <- rbind(all.cnv, df)
+}
+
+
+all.cnv <- read.csv("/Volumes/Xinmeng.HD2/sv.management/merge_cnv_AnnotSV0822.txt",header = T,sep = "\t")
+all.cnv1 <- all.cnv %>% select(SV_chrom, SV_start, SV_end, SV_type,ACMG_class) %>% 
+  unique() %>% 
+  mutate(Types = case_when(ACMG_class == "1" ~ "B/LB",
+                           ACMG_class == "2" ~ "B/LB",
+                           ACMG_class == "3" ~ "VUS",
+                           ACMG_class == "4" ~ "P/LP",
+                           ACMG_class == "5" ~ "P/LP")) %>% unique() 
+
+
+
+cnv.p <- all.cnv1 %>% group_by(Types) %>% summarise(count = n(),.groups = "drop") %>% 
+  rename(Pathogenicity = Types) 
+
+p2 <- ggplot(cnv.p, aes(x = "",y = count, fill = Pathogenicity))+
+  geom_col()+
+  coord_polar(theta = "y",start = 4.4)+
+  scale_fill_manual(values = c("#fc8d62","#F2CC5A","#8da0cb"))+
+  theme_void()+
+  theme(
+    legend.title = element_text(size = 12,family = "Helvetica",colour = "black"),
+    legend.text = element_text(size = 10,family = "Helvetica",colour = "black"),
+    plot.title = element_text(size = 14, family = "Helvetica",colour = "black",hjust = 0.5),
+  )
+
+```
+
