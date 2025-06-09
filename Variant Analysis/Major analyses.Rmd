@@ -1,0 +1,1089 @@
+---
+title: "Newborn Data Analysis"
+author: "Xinmeng Liao"
+date: "2025-06-09"
+output: html_document
+---
+
+# Environment Setup
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(grid)
+library(xlsx)
+library(ggrepel)
+library(jsonlite)
+library(rvest)
+library(tidyr)
+library(tidyverse)
+library(ontologyIndex)
+library(RColorBrewer)
+library(stringr)
+library(stringdist)
+library(pheatmap)
+library(ComplexHeatmap)
+library(colorRamp2)
+library(dendextend)
+library(rvest)
+library(ggVennDiagram)
+library(VennDiagram)
+library(patchwork)
+for (i in c("select","filter","mutate","rename","left_join","slice")){
+  conflicted::conflict_prefer(i,"dplyr")
+}
+conflicted::conflicts_prefer(stats::sd)
+
+
+rm(list = ls())
+gc()
+newborn_org <- read.csv('merge_filtered(all)_NoCommonHCLoF_0822_removeHGMD_annotate_ACMG.csv',header = T) %>% select(-1,-2,-3)
+genedb = read.csv("Genedb.txt",header = T,sep = "\t")
+ukbb.removed.variant <- read.csv("ukbb.removed.variant.txt",header = T,sep = "\t")
+tr.adult.removed.variant <- c("chr12_6034812_C_T","chr21_43063074_A_G","chr21_43066353_G_A","chr16_3243205_C_T",
+              "chr4_186286490_G_A","chr13_20189221_TCTC_T","chr13_20192782_C_T","chr12_49954244_T_A","chr17_39665434_G_A")
+```
+
+# 1. Refining sequenced data
+```{r}
+newborn <-  newborn_org %>% 
+  mutate(MAX_AF_ALL = apply(select(., c(71:89, 138:145)), 1, function(x) max(replace(x, is.na(x), 0)))) %>% 
+  filter(!grepl("Conflicting_classifications_of_pathogenicity",ClinVar_CLNSIG) & ClinVar_CLNSIG != "")  %>% 
+  filter(MAX_AF_ALL < 0.05 | is.na(MAX_AF_ALL)) %>% 
+  filter(ClinVar_ReviewStar >= 2) %>% 
+  filter(Target.group == "Newborn-screening" | Target.group == "Health predipositions/Disease risk") %>% 
+  filter(!is.na(Mark)) %>% 
+  select('Sample',"Gender","SZAID",'Database_type','SZAdiseaseID','Gene','Genes','SZAreportCategory','Zygosity','Genotype',
+         Compound_heterozygous,'Gene.Disease.confidence.level',"IMPACT","ClinVar_CLNSIG",'Database_type',
+         Gene.Disease.confidence.level,Target.group,'Disease',"ClinVar_CLNDN",
+         'X.CHROM','POS','REF','ALT',"Variant_info",'Mark',Inheritance,LoF,Consequence, 
+         'Compound_heterozygous','P0064_WGS','Allele','MAX_AF',MAX_AF_ALL,
+         'HGVSp','HGVSc','Existing_variation','VARIANT_CLASS',acmg_score,acmg_classification,acmg_criteria) %>% 
+  unique() 
+```
+
+# 2. Separate panels, only for known variants 
+```{r}
+data = newborn
+unique(data$Zygosity)
+unique(data$Inheritance)
+
+## Childhood onset: Newborn, Autosomal dominant, Autosomal recessive (homozygous), Male-XLD/XLR
+child = data %>% 
+  filter(Target.group == "Newborn-screening") %>% 
+    filter(
+      Inheritance == "AD" | 
+      Inheritance == "XLD" | 
+      Inheritance == "X-linked multiple and/or complex pattern" | 
+      Inheritance == "Multiple and/or complex pattern" | 
+      Inheritance == "AR; AD" | 
+      (Inheritance == "AR" & Zygosity == "Homozygous")|
+      (Gender == "Female" & Inheritance == "XLR" & Zygosity == "Homozygous") |
+      (Gender == "Male" & Inheritance == "XLR" & Zygosity == "Hemizygous")) %>% 
+    filter(!Variant_info %in% ukbb.removed.variant$variant_info)
+
+# Remove following variants after pipeline refinement 
+remove <- c("chr16_3243205_C_T","chr12_6034812_C_T","chr12_6034812_C_T","chr21_43063074_A_G","chr21_43066353_G_A",
+            "chr4_186286490_G_A","chr13_20189221_TCTC_T","chr13_20192782_C_T","chr13_20189546_AC_A","chr13_20189481_A_G",
+            "chr12_49954244_T_A","chr20_63693211_C_T","chr20_63662520_C_T","chr4_186276365_C_T","chr12_49954171_C_T","chr10_80275073_G_A") 
+
+child <- child %>% filter(!Variant_info %in% remove)
+unique(child$Target.group) #"Newborn-screening"
+
+## Adulthood onset: Health, Autosomal dominant, Autosomal recessive (homozygous), Male-XLD/XLR
+adult = data %>% 
+  filter(Target.group == "Health predipositions/Disease risk") %>% 
+    filter(Inheritance == "AD" | 
+           Inheritance == "XLD" |
+           Inheritance == "X-linked multiple and/or complex pattern" | 
+           Inheritance == "Multiple and/or complex pattern" | 
+           Inheritance == "AR; AD" | 
+      (Inheritance == "AR" & Zygosity == "Homozygous")|
+      (Gender == "Female" & Inheritance == "XLR" & Zygosity == "Homozygous") |
+      (Gender == "Male" & Inheritance == "XLR" & Zygosity == "Hemizygous"))
+
+unique(adult$Target.group)
+
+## Carrier status: Autosomal recessive (heterzygous), Female-XLR (heterzygous)
+carrier = data %>% 
+  filter(Target.group == "Newborn-screening") %>% 
+  filter(Zygosity == "Heterozygous") %>% 
+  filter(Inheritance %in% c("X-linked multiple and/or complex pattern","AR","XLR","AR; AD",
+                             "Multiple and/or complex pattern")) 
+unique(carrier$Target.group) #"Newborn-screening"
+
+carrier <- carrier  %>% filter(!Variant_info %in% child$Variant_info)
+
+```
+
+# 3. Data analysis
+```{r}
+data_manage <- function(data, AF, carrier = FALSE){
+  input = data %>% unique()
+  
+  count <- input %>% 
+    filter(MAX_AF_ALL < AF | is.na(MAX_AF_ALL)) %>% 
+    filter(SZAreportCategory > 7) %>% 
+    filter(acmg_classification  == "Likely_pathogenic" | acmg_classification == "Pathogenic") %>% 
+    filter(ClinVar_CLNSIG != "" & !grepl("Conflicting_interpretations_of_pathogenicity", ClinVar_CLNSIG)) %>% 
+    select(Sample, Gender, Genes,Variant_info,X.CHROM,POS,REF,ALT,
+           HGVSc,HGVSp,Zygosity,IMPACT,ClinVar_CLNSIG,Disease,Inheritance, LoF, Consequence,
+           acmg_score,acmg_classification,acmg_criteria) %>% 
+    mutate(Genotype = case_when(
+      Zygosity == "Heterozygous" ~ paste0(REF,"/",REF,">",REF, "/",ALT),
+      Zygosity == "Hemizygous" ~ paste0(REF,"/",REF,">",REF, "/",ALT),
+      Zygosity == "Homozygous" ~ paste0(REF,"/",REF,">",ALT, "/",ALT)
+      ) ) %>% 
+    mutate(LoF = if_else(LoF == "", NA,LoF)) %>% 
+    distinct() 
+  
+  # Add one GJB2 variants into carrier panel
+  if(carrier == TRUE){
+    extra <- newborn[which(newborn$Genes == "GJB2" & 
+                         newborn$Variant_info == "chr13_20189546_AC_A" & 
+                         newborn$Inheritance == "AR" & 
+                         newborn$SZAreportCategory > 7), ] %>% 
+             select(Sample, Gender, Genes,Variant_info,X.CHROM,POS,REF,ALT,
+                   HGVSc,HGVSp,Zygosity,IMPACT,ClinVar_CLNSIG,Disease,Inheritance, LoF, Consequence,
+                   acmg_score,acmg_classification,acmg_criteria) %>% 
+             mutate(Genotype = case_when(
+              Zygosity == "Heterozygous" ~ paste0(REF,"/",REF,">",REF, "/",ALT),
+              Zygosity == "Hemizygous" ~ paste0(REF,"/",REF,">",REF, "/",ALT),
+              Zygosity == "Homozygous" ~ paste0(REF,"/",REF,">",ALT, "/",ALT)
+              ) ) %>% 
+             mutate(LoF = if_else(LoF == "", NA,LoF)) %>% distinct()
+    count <- rbind(count, extra)
+  }
+
+  gender = count %>% select("Sample", "Gender","Genes", "Variant_info") %>% rename(Gene = Genes)
+  len <- length(unique(count$Sample))
+  sample <- unique(count$Sample)
+
+  count1 <- count %>% 
+    group_by(Genes, Variant_info,Genotype, HGVSc,HGVSp,Zygosity,IMPACT,ClinVar_CLNSIG,LoF, Consequence,
+             acmg_score,acmg_classification,acmg_criteria) %>% 
+    summarise(Unique_sample = n_distinct(Sample),.groups = "drop") %>% 
+    mutate("Variants Carrier Frequency" = Unique_sample/1100) %>% 
+    ungroup() %>% 
+    group_by(Genes) %>%
+    mutate(Total_Unique_Samples = sum(Unique_sample)) %>% 
+    ungroup() %>% 
+    mutate(Total_carrier_frequency = Total_Unique_Samples / 1100 ) %>% 
+    arrange(desc(Total_carrier_frequency),desc(Unique_sample)) %>% 
+    distinct() %>% 
+    left_join(., input[,c("Genes","Variant_info","Disease","Inheritance","MAX_AF_ALL","Zygosity","SZAreportCategory")], 
+              by = c("Genes" = "Genes","Variant_info" = "Variant_info", "Zygosity" = "Zygosity")) %>% 
+    distinct() %>% 
+    filter(SZAreportCategory > 7) %>% select(-SZAreportCategory) %>% unique() %>% 
+    rename("No. of sample for gene" = Total_Unique_Samples,
+           "No. of sample for variant" = Unique_sample,
+           "Variant carrier frequency" = `Variants Carrier Frequency`,
+           "Gene carreir frequency"  = Total_carrier_frequency)
+  
+  
+  final.data.manage <- function(data){
+    final <- data %>% 
+      ungroup() %>% 
+      mutate(Zygosity = case_when(Zygosity == "Homozygous"~"Hom",
+                                  Zygosity == "Heterozygous"~ "Het",
+                                  TRUE ~ Zygosity)) %>% 
+      mutate(ClinVar_CLNSIG = case_when(ClinVar_CLNSIG == "Pathogenic" ~ "P",
+                                       ClinVar_CLNSIG == "Pathogenic/Likely_pathogenic/Pathogenic&_low_penetrance" ~ "P/LP",
+                                       ClinVar_CLNSIG == "Pathogenic&drug_response" ~ "P",
+                                       ClinVar_CLNSIG == "Pathogenic&risk_factor" ~ "P",
+                                       ClinVar_CLNSIG == "Pathogenic/Likely_pathogenic&risk_factor" ~ "P/LP",
+                                       ClinVar_CLNSIG == "Pathogenic/Likely_pathogenic&other" ~ "P/LP",
+                                       ClinVar_CLNSIG == "Likely_pathogenic" ~ "LP",
+                                       ClinVar_CLNSIG == "Likely_pathogenic&drug_response" ~ "LP",
+                                       ClinVar_CLNSIG == "Pathogenic/Likely_pathogenic" ~"P/LP",
+                                       ClinVar_CLNSIG == "Pathogenic,DM" ~ "P, DM", 
+                                       ClinVar_CLNSIG == "Pathogenic/Likely_pathogenic,DM" ~ "P/LP, DM",
+                                       ClinVar_CLNSIG == "Likely_pathogenic,DM" ~ "LP, DM",
+                                       ClinVar_CLNSIG == "DM" ~ "DM",ClinVar_CLNSIG == "DM?" ~ "DM?",
+                                       TRUE ~  "/")) %>% 
+      mutate(HGVSc = sapply(strsplit(HGVSc, ":"), `[`, 2)) %>% 
+      mutate(HGVSp = sapply(strsplit(HGVSp, ":"), `[`, 2)) %>% 
+      mutate(HGVSp= replace_na(HGVSp, "/")) %>% 
+      rename(Variation = HGVSc) %>%
+      rename(Inh = Inheritance) %>% 
+      rename(Pathogenicity = ClinVar_CLNSIG) %>% 
+      select(Disease, Inh, Genes, Genotype,Zygosity,Variation, HGVSp,Pathogenicity,IMPACT,LoF,Consequence, 
+             `No. of sample for variant`,acmg_score,acmg_classification,acmg_criteria,
+             `Variant carrier frequency`, `No. of sample for gene`,`Gene carreir frequency`,  MAX_AF_ALL,Variant_info) %>% 
+      mutate(MAX_AF_ALL = if_else(MAX_AF_ALL == 0, NA, MAX_AF_ALL))
+  
+  return(final)
+  }
+
+  final <- final.data.manage(count1)
+  
+  final1 <- final %>% 
+    group_by(Inh,Genes,Genotype,Zygosity,Variation,HGVSp,Pathogenicity,IMPACT,LoF,Consequence, 
+             `No. of sample for variant`,`Variant carrier frequency`,`No. of sample for gene`,
+             `Gene carreir frequency`,MAX_AF_ALL,Variant_info) %>% 
+    mutate(Disease = paste(Disease, collapse = "; ")) %>% ungroup() %>% unique() %>% 
+    arrange(desc(`No. of sample for gene`),Genes,desc(`No. of sample for variant`),Disease)
+    
+  len2 <- length(unique(unlist(strsplit(split = "; ",final1$Disease))))
+  len3 <- length(unique(final1$Variant_info))
+  len4 <- length(unique(final1$Genes))
+  
+  vaf <- final1 %>% group_by(Variant_info) %>% 
+    summarise(`No. of sample for variant_info` = sum(`No. of sample for variant`)) %>% 
+    mutate(`Vairant_info carreir frequency` = `No. of sample for variant_info` / 1100)
+    
+  
+  final1 <- final1 %>% left_join(., vaf, by = "Variant_info")
+  
+  return(list(no.sample = len, no.disease = len2, no.variant = len3, no.gene = len4, sample = sample, df = final1)) 
+}
+
+child_result <- data_manage(child, 0.01)$df
+adult_result <- data_manage(adult, 0.01)$df
+carrier_result <- data_manage(carrier, 0.01, carrier = T)$df
+```
+
+# 4. Figure 3A
+```{r}
+# SMA results are phased by DRAGEN, and GJB2 c.35del need to be added additionally
+sma <- read.csv("SMN_result.txt",header = T,sep = "\t") %>% filter(isCarrier == "true")
+
+s.carrier <- data_manage(carrier, 0.01, carrier = T)$sample
+df <- carrier %>% 
+  filter(Sample %in% s.carrier) %>% 
+  filter(Variant_info %in% carrier$Variant_info) %>% 
+  select(Sample, Variant_info) %>% unique() %>% 
+  rbind(., sma %>% select(Sample) %>% mutate(Variant_info = "SMA")) %>% unique() %>% 
+  group_by(Sample) %>% 
+  summarise(Var_num = n_distinct(Variant_info),.groups = "drop") %>% 
+  arrange(desc(Var_num)) 
+
+df_plot <- df %>% 
+  group_by(Var_num) %>%
+  count() %>% 
+  rename(Sample_num = n)%>% mutate(Type = "Carrier status")
+
+df1 = child %>% 
+  filter(Variant_info %in% child_result$Variant_info) %>% 
+  select(Sample, Variant_info) %>% unique() %>% 
+  group_by(Sample) %>% 
+  summarise(Var_num = n_distinct(Variant_info),.groups = "drop") %>% 
+  arrange(desc(Var_num)) 
+
+df_plot1 <- df1 %>% 
+  group_by(Var_num) %>%
+  summarise(Sample_num = n()) %>% ungroup() %>% 
+   mutate(Type = "Childhood-onset disease")
+
+df_all <- rbind(df_plot1,df_plot)
+df_all$Type = factor(df_all$Type, levels = unique(df_all$Type))
+
+p.carrier = ggplot(df_all %>% filter(Type == "Carrier status"), aes(x = Var_num, y = Sample_num, fill = Type))+
+  geom_bar(stat = "identity", fill = "#B3DDF2")+
+  theme_classic()+
+  facet_wrap(~ Type, scales = "free_x", ncol = 1) + 
+  labs(x = "No. of variant", y = "No. of Newborn")+
+  theme(axis.title.x = element_text(size = 23, family = "Helvetica", color = "black"),
+        axis.title.y = element_text(size = 23,family = "Helvetica",color = "black"),
+        axis.text.x = element_text(size = 20, family = "Helvetica",color = "black",margin = margin(b = 8)),
+        axis.text.y = element_text(size = 20, family = "Helvetica",color = "black",margin = margin(l = 8)),)+
+  theme(strip.background = element_rect(fill = "#f0f0f0", color = "black"),
+        strip.text = element_text(size = 20, color = "black",family = "Helvetica"),
+        panel.grid.major.x = element_blank(),
+        legend.position = "none") +
+  scale_x_continuous(breaks = seq(0,6,1))+
+  scale_y_continuous(breaks = seq(0,450,100))
+
+p.child = ggplot(df_all %>% filter(Type != "Carrier status"), aes(x = Var_num, y = Sample_num, fill = Type))+
+  geom_bar(stat = "identity", fill = "#B3DDF2")+
+  theme_classic()+
+  facet_wrap(~ Type, scales = "free_x", ncol = 1) + 
+  labs(x = "No. of variant", y = "No. of newborn")+
+  theme(axis.title.x = element_text(size = 23, family = "Helvetica", color = "black"),
+        axis.title.y = element_text(size = 23,family = "Helvetica",color = "black"),
+        axis.text.x = element_text(size = 20, family = "Helvetica",color = "black",margin = margin(b = 8)),
+        axis.text.y = element_text(size = 20, family = "Helvetica",color = "black",margin = margin(l = 8)),)+
+  theme(strip.background = element_rect(fill = "#f0f0f0", color = "black"),
+        strip.text = element_text(size = 20, color = "black",family = "Helvetica"),
+        panel.grid.major.x = element_blank(),
+        legend.position = "none") +
+  scale_x_continuous(breaks = seq(0,6,1))+
+  scale_y_continuous(breaks = seq(0,100,20))
+```
+
+
+# 5. Figure 3C
+```{r}
+# count gene length
+library(biomaRt)
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene_lengths <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol", 
+                                     "chromosome_name", "start_position", 
+                                     "end_position"),
+                      filters = "biotype",
+                      values = "protein_coding",
+                      mart = ensembl)
+gene_lengths$gene_length <- gene_lengths$end_position - gene_lengths$start_position + 1
+
+number <- child_result %>% filter(`No. of sample for gene` >=2) %>% arrange(desc(`No. of sample for gene`)) %>% 
+  select(Genes, `No. of sample for gene`) %>% unique()
+plp_number <- child_result %>% 
+  filter(`No. of sample for gene` >=2) %>% 
+  arrange(desc(`No. of sample for gene`)) %>% 
+  mutate(Pathogenicity = if_else(Pathogenicity == "P/LP" , "P", Pathogenicity)) %>% 
+  unique() %>%
+  group_by(Genes, Pathogenicity) %>% 
+  summarise(count = n(), .groups = 'drop') %>%
+  filter(Pathogenicity %in% c("P", "LP"))
+
+# childhood disease with number of genes > 2 
+ontology <- read.xlsx("ontology top.xlsx",sheetIndex = 1)
+ontology <- ontology %>% 
+  filter(Genes %in% number$Genes) %>% 
+  left_join(., gene_lengths[,c("hgnc_symbol","gene_length")], by = c("Genes" = "hgnc_symbol")) %>% 
+  left_join(., number, by = c("Genes")) %>% 
+  rename(count = `No. of sample for gene`) %>% 
+  mutate(adjust = (count/gene_length) * 100000) 
+plp_number <- plp_number %>% filter(Genes %in% number$Genes) %>% 
+  left_join(., gene_lengths[,c("hgnc_symbol","gene_length")], by = c("Genes" = "hgnc_symbol")) %>%
+  pivot_wider(names_from = Pathogenicity, values_from = count, values_fill = list(count = 0)) %>% 
+  pivot_longer(cols = c(P, LP), names_to = "Pathogenicity", values_to = "count") %>%
+  mutate(P.adjust = (count/gene_length) * 100000)
+
+ontology <- ontology %>% select(Genes, adjust) %>% left_join(., plp_number, by = "Genes") %>% unique()
+ontology$Genes <- factor(ontology$Genes, levels =  rev(c("MEFV","LDLR","SLC3A1","SLC7A9","COL7A1" ,"G6PD","PKP2", "RYR1" ,
+                                                     "TNFRSF13B","RTEL1","SCN4A","SPTA1" )))
+
+library("ggthemes")
+p1 <- ggplot(ontology, aes(y = Genes, x = P.adjust, fill = Genes,alpha = Pathogenicity)) +
+  geom_bar(stat = "identity") +
+  #scale_color_manual(values = custom_colors)+
+  theme_classic() +
+  scale_x_continuous(breaks = seq(0,15,2)) +
+  scale_fill_tableau(palette = "Tableau 20",direction = -1) + 
+  #scale_color_manual(values = gene_colors)+
+  scale_alpha_manual(values = c("P" = 1, "LP" = 0.6)) +
+  labs(
+    y = NULL,
+    x = "Adjusted variant number",
+  )+
+  scale_y_discrete(position = "left")+ 
+  theme(axis.title.x = element_text(size = 15,family = "Helvetica",color = "black"),
+        axis.title.y = element_blank(),
+        axis.text.x = element_text(size = 15,family = "Helvetica",color = "black"),
+        axis.text.y = element_blank())+
+        #axis.text.y = element_text(size = 15,family = "Helvetica",color = "black"))+
+  theme(legend.position = "none")
+ggsave(p1, filename="Results_250216/Figure3C2.png",width = 8,height = 15 ,dpi = 600,units = "cm")
+
+middle <- read.xlsx("Results_1115/ontology top.xlsx",sheetIndex = 1) %>% 
+  mutate(combine = paste(Genes, Disease, sep = " ")) %>% 
+  select(Genes, combine) %>% unique() %>% 
+  mutate(number = 1)
+middle$combine[which(middle$Genes == "SCN4A")] <- "SCN4A  hypoPP2; PC; Potassium-aggravated myotonia"
+middle$combine[which(middle$Genes == "RYR1")] <- "RYR1 Central core myopathy; Malignant hyperthermia, susceptibility to, 1"
+middle <- unique(middle)
+order <- middle$combine
+middle <- middle[c(1:3,10,4:9,11),]
+
+middle1 <- middle %>% left_join(., unique(child_result[,c("Genes","No. of sample for gene")]), by = "Genes")
+middle1$`No. of sample for gene` <- as.factor(middle1$`No. of sample for gene`)
+middle1$combine <- factor(middle1$combine,
+                         levels = rev(middle1$combine))
+middle1$Genes <- factor(middle1$Genes, 
+                             levels =  rev(c("MEFV","LDLR","SLC3A1","SLC7A9" ,"COL7A1" ,"G6PD","PKP2", "RYR1" ,
+                                             "TNFRSF13B","RTEL1","SCN4A","SPTA1" )))
+
+p2 <- ggplot(middle1, aes(y = Genes, x = "")) +
+  geom_tile(aes(fill =`No. of sample for gene` )) +
+  theme_classic()+
+    scale_fill_manual(
+    values = c("59" = "#54278f", "6" = "#756bb1", "4" = "#9e9ac8",  "3" = "#bcbddc","2" = "#dadaeb"  )) +
+  labs(x = NULL, y = NULL, fill = "Mutated Gene Frequency")+
+  scale_y_discrete(position = "left")+
+  scale_x_discrete(position = "bottom")+
+  labs(x = "Gene mutated frequency")+
+  theme(axis.title.x = element_text(size = 15,family = "Helvetica",color = "black"), axis.ticks.x = element_blank(),
+        axis.title.y = element_blank(),axis.line.x = element_blank(),
+        axis.text.x = element_text(size = 15,family = "Helvetica",color = "black", angle = 0 ,hjust =1,vjust = -3),
+        axis.text.y = element_text(size = 15,family = "Helvetica",color = "black"), axis.ticks = element_blank(),
+        #axis.line.y = element_blank(size = 12,family = "Helvetica",color = "black"),
+        legend.title = element_text(size = 10, family = "Helvetica",color = "black"),
+        legend.text = element_text(size = 10, family = "Helvetica",color = "black"))+
+    theme(legend.position = "top")
+
+heatmap_data <- read.xlsx("ontology top.xlsx",sheetIndex = 1) %>% 
+  group_by(Genes, Category) %>% summarise(count = n(),.groups = "drop") %>% mutate(count = 1) %>% unique()
+heatmap_data$Category[which(heatmap_data$Category == "Autoimmune, inflammatory,and immunogenetic disorders")] = 
+  "Autoimmune, inflammatory,\nand immunogenetic disorders"
+heatmap_data$Category[which(heatmap_data$Category == "Neurodevelopmental, neurodegenerative,and neurogenetic disorders")] = 
+  "Neurodevelopmental, neurodegenerative,\nand neurogenetic disorders"
+heatmap_data$Genes <- factor(heatmap_data$Genes, 
+                             levels =  c("MEFV","LDLR","SLC3A1","SLC7A9" ,"COL7A1" ,"G6PD","PKP2", "RYR1" ,
+                                             "TNFRSF13B","RTEL1","SCN4A","SPTA1" ))
+library(ggalluvial)
+p3 <- ggplot(heatmap_data, aes(axis1 = Genes, axis2 = Category, y = count)) +
+  geom_alluvium(aes(fill = Genes), width = 1/8) +
+  geom_stratum(aes(fill = Genes),width = 1/8, color = "black",) + # left and right frame
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 0) +  # tag for left and right
+  scale_x_discrete(limits = c("Genes", "Category"), expand = c(0.1, 0.1)) +
+  theme_classic() +
+  scale_fill_tableau(palette = "Tableau 20", direction = 1) +
+  theme(
+    axis.title = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    axis.line = element_blank(),
+    legend.position = "none"
+  )
+
+```
+
+
+# 6. Supplementary Figure 1A
+```{r}
+count_depth <- read.xlsx("merge_gender_count_depth(all)_0822.xlsx",sheetIndex = 1) 
+mean(count_depth$Variant_count) #4985388
+mean(count_depth$Depth) #34.64159
+max(count_depth$Depth) #71.44
+min(count_depth$Depth) #23.23
+
+stat_plot <- count_depth %>% 
+  mutate(nor = Variant_count/100000) %>% 
+  mutate(Sample = as.numeric(sapply(strsplit(Sample, "_"), `[`, 2))) %>% 
+  mutate(Variant_large = Variant_count/100000)
+
+p <- ggplot(stat_plot, aes(x = Sample))+
+  geom_line(aes(y = Depth, group = 1),linewidth =1, color = "#3B528B")+
+  geom_line(aes(y = nor, group = 1),linewidth = 1, color = "#ED7953")+
+  scale_y_continuous(
+    name = "Depth",
+    sec.axis = sec_axis(
+      trans = ~ . * 1000000, 
+      name = "No. of variant",
+      labels = function(x) {
+        paste0(round(x / 1e7, 1), "×10^7")
+      }
+    )
+  )+
+  theme_classic()+
+  theme(axis.title.y = element_text(size=20, family = "Helvetica",colour = "black"),
+    axis.title.y.right = element_text(size=20, family = "Helvetica",colour = "black"),
+    axis.title.x = element_text(size=20, family = "Helvetica",colour = "black"),
+    axis.text.y = element_text(size=18, family = "Helvetica",colour = "black"),
+    axis.text.y.right = element_text(size=18, family = "Helvetica",colour = "black"),
+    axis.text.x = element_text(size=18, family = "Helvetica",colour = "black"))+
+  labs(x = "No. of Newborn")+
+  scale_x_continuous(breaks = seq(0,1100,200))
+```
+
+# 8. Figure 5A
+```{r}
+# Merge files
+df <- read.csv("PGx_merged.txt",header = T,sep = "\t")
+pgx_data <- read.csv("PGx_annotation0515.txt",header = T,sep = "\t")
+
+# Analyse numbers
+remove_ref = c("Reference/Reference","B(wildtype)/B(wildtype)","Reference","*1/*1","B(wildtype)","./.",".")
+
+df1 <- df %>% 
+  filter(gene %in% pgx_data$Gene) %>% unique() %>% 
+  filter(!diplotype %in% remove_ref)
+
+df2 <- df1 %>% 
+  group_by(gene, diplotype) %>% summarise(count = n(),.groups = "drop") %>% 
+  mutate(Frequency = count / length(files))
+
+df3 <- df1 %>% 
+  mutate(together = paste(gene, diplotype, sep = "_")) %>% 
+  select(Sample, together) %>% unique() %>% 
+  group_by(Sample) %>% summarise(count = n(),.groups = "drop") %>% 
+  group_by(count) %>% summarise(total = n(),.groups = "drop") 
+  
+p <- ggplot(df3, aes(x =count , y = total))+
+  #geom_bar(stat = "identity",fill = "#377EB8")+
+  geom_bar(stat = "identity",fill = "#9ecae1")+
+  theme_classic()+
+  labs(x = "No. of PGx diplotypes", y = "No. of newborn")+
+  theme(axis.title.x = element_text(size = 15,  family = "Helvetica", color = "black"),
+        axis.title.y = element_text(size = 15,family = "Helvetica",color = "black"),
+        axis.text.x = element_text(size = 15, family = "Helvetica",color = "black"),
+        axis.text.y = element_text(size = 15, family = "Helvetica",color = "black"))+
+  scale_x_continuous(breaks = seq(2, 14, 1))
+
+# Extract the pediatric drugs 
+pediatric <- df2 %>% filter(gene %in% pgx_data$Gene) %>% unique()
+```
+
+# 9. Figure 5B
+```{r}
+top5 <- c("ivacaftornon-responsiveCFTRsequence/ivacaftornon-responsiveCFTRsequence",
+          "rs9923231variant(T)/rs9923231reference(C)",
+          "rs12979860variant(T)/rs12979860reference(C)",
+          "*28/*80:*80+*28/*1","rs9923231variant(T)/rs9923231variant(T)")
+pediatric <- pediatric %>% 
+  filter(diplotype %in% top5) %>% unique()
+top <- data.frame(gene = c("CFTR","VKORC1","IFNL3","UGT1A1","IFNL3","VKORC1","VKORC1"),
+                   rsID = c('rs75527207','rs9923231','rs12979860','rs3064744','rs12979860',"rs9923231","rs9923231"),
+                   genotype = c("GG","CT","CT","*28","CC","CC","TT"),
+                  Frequency = c(0.9727272727, 0.4927272727, 0.4572727273, 0.4527272727, 0.4218181818,
+                                0.2618181818, 0.2454545455)) %>% 
+  select(gene,rsID, genotype,Frequency)
+
+# VEP run global AF for top 5 PGx variation %>% 
+af = read.csv("PGx_AF_VEP250217.txt",header = T,sep = "\t") %>% slice(1:7) %>% 
+  mutate(
+    gnomADg_AFR_Genotype_AF = case_when(
+      genotype == ref.genotype ~ gnomADg_AFR_REF_AF * gnomADg_AFR_REF_AF,
+      genotype == alt.genotype ~ gnomADg_AFR_AF * gnomADg_AFR_AF,
+      genotype == ref.alt.genotype ~ 2 * gnomADg_AFR_REF_AF * gnomADg_AFR_AF,
+      TRUE ~ NA_real_
+    ),
+    gnomADg_AMR_Genotype_AF = case_when(
+      genotype == ref.genotype ~ gnomADg_AMR_REF_AF * gnomADg_AMR_REF_AF,
+      genotype == alt.genotype ~ gnomADg_AMR_AF * gnomADg_AMR_AF,
+      genotype == ref.alt.genotype ~ 2 * gnomADg_AMR_REF_AF * gnomADg_AMR_AF,
+      TRUE ~ NA_real_
+    ),
+    gnomADg_ASJ_Genotype_AF = case_when(
+      genotype == ref.genotype ~ gnomADg_ASJ_REF_AF * gnomADg_ASJ_REF_AF,
+      genotype == alt.genotype ~ gnomADg_ASJ_AF * gnomADg_ASJ_AF,
+      genotype == ref.alt.genotype ~ 2 * gnomADg_ASJ_REF_AF * gnomADg_ASJ_AF,
+      TRUE ~ NA_real_
+    ),
+    gnomADg_EAS_Genotype_AF = case_when(
+      genotype == ref.genotype ~ gnomADg_EAS_REF_AF * gnomADg_EAS_REF_AF,
+      genotype == alt.genotype ~ gnomADg_EAS_AF * gnomADg_EAS_AF,
+      genotype == ref.alt.genotype ~ 2 * gnomADg_EAS_REF_AF * gnomADg_EAS_AF,
+      TRUE ~ NA_real_
+    ),
+    gnomADg_FIN_Genotype_AF = case_when(
+      genotype == ref.genotype ~ gnomADg_FIN_REF_AF * gnomADg_FIN_REF_AF,
+      genotype == alt.genotype ~ gnomADg_FIN_AF * gnomADg_FIN_AF,
+      genotype == ref.alt.genotype ~ 2 * gnomADg_FIN_REF_AF * gnomADg_FIN_AF,
+      TRUE ~ NA_real_
+    ),
+    gnomADg_MID_Genotype_AF = case_when(
+      genotype == ref.genotype ~ gnomADg_MID_REF_AF * gnomADg_MID_REF_AF,
+      genotype == alt.genotype ~ gnomADg_MID_AF * gnomADg_MID_AF,
+      genotype == ref.alt.genotype ~ 2 * gnomADg_MID_REF_AF * gnomADg_MID_AF,
+      TRUE ~ NA_real_
+    ),
+    gnomADg_NFE_Genotype_AF = case_when(
+      genotype == ref.genotype ~ gnomADg_NFE_REF_AF * gnomADg_NFE_REF_AF,
+      genotype == alt.genotype ~ gnomADg_NFE_AF * gnomADg_NFE_AF,
+      genotype == ref.alt.genotype ~ 2 * gnomADg_NFE_REF_AF * gnomADg_NFE_AF,
+      TRUE ~ NA_real_
+    ),
+    gnomADg_SAS_Genotype_AF = case_when(
+      genotype == ref.genotype ~ gnomADg_SAS_REF_AF * gnomADg_SAS_REF_AF,
+      genotype == alt.genotype ~ gnomADg_SAS_AF * gnomADg_SAS_AF,
+      genotype == ref.alt.genotype ~ 2 * gnomADg_SAS_REF_AF * gnomADg_SAS_AF,
+      TRUE ~ NA_real_
+    )) %>% 
+  select(1:5,25:32) %>% 
+  left_join(., top, by = c("X.Uploaded_variation" = "rsID",
+                           "SYMBOL" = "gene", "genotype")) %>% unique() %>% 
+  dplyr::rename(gnomADg_TR_Genotype_AF = Frequency) %>% 
+  dplyr::rename(rsID = X.Uploaded_variation) %>% 
+  mutate(genotype = paste(SYMBOL, rsID, genotype,sep = "_")) 
+af$genotype[3] = "UGT1A1*28"
+  
+
+## ComplexHeatmap for top 5 PGx
+mat<- af %>% 
+  select(4,6:ncol(af))  %>% 
+  column_to_rownames("genotype")%>% as.matrix() 
+rowname = rownames(mat) 
+colname = gsub("_Genotype_AF","",colnames(mat))
+colname = gsub("gnomADg_","",colname)
+mat <- apply(mat, 2,function(x) as.numeric(as.character(x)))
+colnames(mat) <- colname
+rownames(mat) <- rowname
+
+f2 = colorRamp2(c(0,0.5, 1), c( "white", "lightblue","#86A6C2"), space = "RGB")
+col_fun <- c("UGT1A1" = "#9bc79d","VKORC1" = "#bab1c7","IFNL3" = "#f3c593","CFTR" = "#c97c7c")
+row_ha = rowAnnotation(Gene =  af$SYMBOL,col = list(Gene = col_fun),
+                       simple_anno_size = unit(2, "cm"))
+
+Heatmap(mat, name = "AF",
+        col = f2,
+        column_names_rot = 90,show_row_names = T, 
+        #row_split = rowsplit,
+        row_names_rot = 0,
+        row_names_gp = gpar(fontsize = 12),
+        show_column_names = T,
+        left_annotation = row_ha,
+        border = F,cluster_columns = T, cluster_rows = T) 
+
+```
+
+# 10. Novel predicted loss-of-function variants analysis
+```{r}
+# Remove the Prediction variants with benign/VUS ClinVar definition 
+library(vcfR)
+vcf_data <- read.vcfR("Predict_variant_ClinVar_vcf_annotated.vcf.gz")
+vcf <- vcf_data@fix %>% as.data.frame()
+index <- vcf %>% mutate(Variant_info = paste(CHROM,POS,REF,ALT,sep = "_"))
+
+predict <- newborn_org %>% 
+  mutate(MAX_AF_ALL = apply(select(., c(71:89, 138:145)), 1, function(x) max(replace(x, is.na(x), 0)))) %>% 
+  filter(MAX_AF_ALL < 0.01 | is.na(MAX_AF_ALL)) %>% 
+  filter(Database_type == "")  %>% 
+  filter(Target.group == "Newborn-screening" | Target.group == "Health predipositions/Disease risk") %>% 
+  filter(Inheritance != "Unknown") %>% 
+  filter(!is.na(Mark)) %>% 
+  select('Sample',"Gender","SZAID",'Database_type','SZAdiseaseID','Gene','Genes','SZAreportCategory','Zygosity','Genotype',IMPACT,
+         Compound_heterozygous,'Gene.Disease.confidence.level',"IMPACT","ClinVar_CLNSIG","HGMD.class",'Database_type',
+         Gene.Disease.confidence.level,Target.group,'Disease',"ClinVar_CLNDN","HGMD.phenotype",
+         'X.CHROM','POS','REF','ALT',"Variant_info",'Mark',Inheritance,LoF,Existing_variation,
+         'Compound_heterozygous','P0064_WGS','Allele','MAX_AF',MAX_AF_ALL,BIOTYPE,VARIANT_CLASS,
+         'HGVSp','HGVSc','Existing_variation','VARIANT_CLASS',Consequence) %>% 
+  filter(!Variant_info %in% index$Variant_info) %>%
+  unique()
+
+count <- predict %>% 
+  filter(MAX_AF_ALL < 0.01 | is.na(MAX_AF_ALL)) %>%
+  filter(Existing_variation == "" | is.na(Existing_variation)) %>% 
+  select(Sample, Gender, Genes,Variant_info,X.CHROM,POS,REF,ALT,Consequence, IMPACT,
+         HGVSc,HGVSp,Zygosity,IMPACT,Disease,Inheritance,LoF,Existing_variation,VARIANT_CLASS,BIOTYPE) %>% 
+  mutate(Genotype = case_when(
+    Zygosity == "Heterozygous" ~ paste0(REF,"/",REF,">",REF, "/",ALT),
+    Zygosity == "Hemizygous" ~ paste0(REF,"/",REF,">",REF, "/",ALT),
+    Zygosity == "Homozygous" ~ paste0(REF,"/",REF,">",ALT, "/",ALT)
+    ) ) %>% 
+  distinct() 
+gender = count %>% select("Sample", "Gender","Genes", "Variant_info") %>% rename(Gene = Genes)
+
+```
+
+# 12. Figure 4
+```{r}
+# Count the overlapped genes in all projects
+overlap <- genedb %>% 
+  mutate(EarlyCheck = case_when(grepl("EarlyCheck_1",Mark) ~ "Group1",
+                                grepl("EarlyCheck_2",Mark) ~ "Group2",
+                                grepl("EarlyCheck_3",Mark) ~ "Group3",
+                                grepl("EarlyCheck_4",Mark) ~ "Group4", TRUE ~ ""),
+         BabySeq = case_when( grepl("BabySeq_A",Mark)~ "GroupA",
+                                grepl("BabySeq_B",Mark) ~ "GroupB", TRUE ~ ""),
+         Genomic101 = if_else(grepl("Genomic101",Mark), "Yes", ""),
+         Nurture = if_else(grepl("Nurture",Mark), "Yes", ""),
+         rWGS = case_when(grepl("rWGS_A",Mark)~ "GroupA",
+                          grepl("rWGS_B",Mark) ~ "GroupB", TRUE ~ ""),
+         ACMG = if_else(grepl("ACMG",Mark), "Yes", ""))
+
+# BabySeq
+babyseq <- read.xlsx("/BabySeq carrier status results.xlsx",sheetIndex = 1)
+babyseq1 <- babyseq %>% separate(col = Variation, into = c("transcript","protein"),sep = "p\\.") %>% 
+  select(1,2,3,Number.of.cases) %>% 
+  slice(-255,-256) %>% 
+  mutate(transcript = gsub(" ","",transcript))
+colnames(babyseq1)[1:2] <- c("Genes", "Variation")
+
+# EarlyCheck
+early <- read.xlsx("EarlyCheck positive results.xlsx",sheetIndex = 3) 
+early_data <- early %>% 
+  select(Sample,Genes) %>% unique() %>% 
+  group_by(Genes) %>% 
+  summarise(count = n(),.groups = "drop")
+
+
+# BabyDetect 
+detect <- read.xlsx("BabyDetect.xlsx",sheetIndex = 1)
+detect <- detect %>% mutate(Genotype = gsub("\\[","",Genotype), 
+                            Genotype = gsub("\\]","",Genotype),
+                            Genotype = gsub(";","-c.",Genotype),
+                            Genotype = gsub("–","-",Genotype)) %>% 
+  separate_rows(sep = "-", Genotype) %>% unique() %>% 
+  select(Case.no.,Gene,Genotype) %>% 
+  group_by(Gene, Genotype) %>% summarise(count= n(),.groups = "drop") 
+
+# Guardian
+guardian.gene <- read.xlsx("Guardian.xlsx",sheetIndex = 1) %>% mutate(Gene = gsub(" ","", Gene))
+guardian.transcript <- read.xlsx("Guardian.xlsx",sheetIndex = 2) %>% 
+  mutate(Gene = gsub(" ","", Gene),
+         Transcript = gsub(" ","", Transcript),
+         Protein = gsub(" ","", Protein)) 
+guardian <- guardian.gene %>% 
+  left_join(., guardian.transcript, by = "Gene") %>% unique()
+
+# monogenetic results overlap
+baby_genes_m = c("BRCA2","BTD","CD46","ELN","KCNQ4","MYBPC3","TTN","VCL","BRCA2","MSH2")
+early_genes_m = c("RAD51C","BRCA2","F11","OTC","LDLR","DSC2","OCRL")
+detect_genes_m = detect$Gene %>% unique()
+guardian_genes_m = guardian$Gene %>% unique()
+child_genes_m = c(unique(child_result$Genes),unique(adult_result$Genes))
+
+library(VennDiagram)
+venn.diagram(
+  x = list(
+  BabySeq = baby_genes_m,
+  `NC` = early_genes_m,
+  `TR` = child_genes_m,
+  BabyDetect = detect_genes_m,
+  Guardian = guardian_genes_m),
+  
+  filename = "Figure4B-1.png",
+  
+  main = "Monogenenic disease positive Status genes",
+  main.cex = 1,
+  main.fontface = "bold",
+  main.fontfamily = "Helvetica",
+  output=NULL,
+  scaled = F, 
+  
+  imagetype="png" ,
+  units = "cm",
+  height = 12 , 
+  width = 12 , 
+  resolution = 600,
+  compression = "lzw",
+        
+  lwd = 2,
+  lty = 'blank',
+  fill = c("#f38181", "#c1b2f2","#fce38a", "#95e1d3","#8abdf0"),
+
+  cex = 1.6,
+  fontfamily = "Helvetica",
+  cat.default.pos = "outer",
+  cat.cex = 0
+)
+
+
+# Carrier status overlap
+baby_genes = unique(babyseq1$Genes) %>% gsub("\n","",.)
+early_genes = unique(early$Genes)
+carrier_genes = c(unique(carrier_result$Genes), "SMN1","SMN2")
+
+venn.diagram(
+  x = list(
+  BabySeq = baby_genes,
+  `NC` = early_genes,
+  `TR` = carrier_genes),
+  
+  filename = "Figure4C-2.png",
+  
+  main = "Carrier Status genes",
+  main.cex = 1,
+  main.fontface = "bold",
+  main.fontfamily = "Helvetica",
+  output=NULL,
+  scaled = F, 
+  lwd = 2,
+  
+  imagetype="png" ,
+  units = "cm",
+  height = 12 , 
+  width = 12 , 
+  resolution = 300,
+  compression = "lzw",
+        
+  lty = 'blank',
+  fill = c("#f38181","#c1b2f2", "#fce38a"),
+
+  cex = 2,
+  cex.cex = 0,
+  fontfamily = "Helvetica"
+)
+
+
+# Upset plot
+i1 <- intersect(baby_genes,early_genes)
+i2 <- intersect(i1,carrier_genes)
+
+d_carrier <- carrier_result %>% filter(Genes %in% i2) %>% select(Genes,`No. of sample for gene`) %>% unique() %>% 
+  mutate(Group = "TR Newborn") %>% 
+  rename(Number = `No. of sample for gene`)
+d_baby <- babyseq1 %>% filter(Genes %in% i2) %>% select(Genes,Number.of.cases) %>% unique() %>% 
+  mutate(Group = "BabySeq") %>% 
+  rename(Number = Number.of.cases)
+d_early <- early_data %>% filter(Genes %in% i2)%>% mutate(Group = "NC NEXUS") %>% unique() %>% 
+  rename(Number = count)
+d_all <- rbind(d_carrier,d_baby,d_early) %>% arrange(desc(Number))
+d_all$Genes <- factor(d_all$Genes, levels = unique(d_all$Genes))
+
+library(ggsci)
+p1 <- ggplot(d_all, aes(x = Genes,y = Number, fill = Group))+
+  geom_bar(stat = "identity")+
+  theme_classic()+ 
+  #scale_fill_locuszoom()+
+  #scale_fill_futurama()+
+  labs(y = "No. of Newborn", x = "Genes")+
+  scale_fill_manual(values = c("#6CC5B0","#EFB118","#97BBF5")) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 0,family = "Helvetica",color = "black"),
+        axis.text.x = element_text(size = 12, family = "Helvetica",color = "black",
+                                   angle = 45,hjust = 1),
+        axis.text.y = element_text(size = 15,family = "Helvetica",color = "black"),
+        legend.text = element_text(size = 13,family = "Helvetica",color = "black"),
+        legend.title = element_text(size = 13,family = "Helvetica",color = "black"))+
+  scale_y_continuous(breaks = seq(0,40,5))
+
+library(UpSetR)
+r_carrier <- carrier_result %>% filter(Genes %in% i2) %>% select(Genes,Variation) %>% unique() %>% 
+  mutate(Group = "TR Newborn") 
+r_baby <- babyseq1 %>% filter(Genes %in% i2) %>% select(Genes, Variation) %>% unique() %>% 
+  mutate(Group = "BabySeq")
+r_early <- early %>% filter(Genes %in% i2)%>% select(Genes,Transcript) %>% mutate(Group = "NC NEXUS") %>% unique() %>% 
+  rename(Variation = Transcript)
+r_all <- rbind(r_carrier, r_baby, r_early)
+r_all1 <- r_all%>% 
+  group_by(Genes) %>% summarise(`No. of Transcripts` = n(),.groups = "drop")
+r_all2 <- rbind(r_carrier, r_baby, r_early) %>% 
+  mutate(Variation = gsub(" ","",Variation)) %>% 
+  mutate(Variation = gsub("\n","",Variation)) %>% 
+  mutate(Variation = gsub("del.*","del",Variation)) %>% 
+  group_by(Genes, Variation) %>% summarise(`No. of Transcript overlapped` = n(),.groups = "drop") %>% 
+  left_join(., r_all1,by = c("Genes")) %>% 
+  mutate(rate = `No. of Transcript overlapped`  / `No. of Transcripts`)
+
+# Transcripts sharing plot
+r_all$Variation <- gsub("\n","",r_all$Variation)
+share <- r_all %>%  
+  group_by(Genes,Group) %>% summarise(transcript.count = n(), .groups = "drop")  
+share$Group <- factor(share$Group, levels = rev(c("BabySeq","TR Newborn","NC NEXUS")))
+share$Genes <- factor(share$Genes, 
+                      levels = c('GJB2','CFTR','GAA','MMACHC','VWF','ACADM','RNASEH2B',
+                                 'SLC26A4','ASL','IDUA','MCCC1','POLG','BBS1','APTX','WRN'))
+
+shared_transcript <- r_all %>%
+  group_by(Genes,Variation) %>% summarise(share.count = n(), .groups = "drop") %>% 
+  left_join(., r_all, by = c("Genes","Variation")) %>% 
+  mutate(share.rate = share.count/3) %>% 
+  filter(share.count > 1) 
+shared_transcript$Group <- factor(shared_transcript$Group, levels = rev(c("BabySeq","TR Newborn","NC NEXUS")))
+share.total <- share %>% 
+  group_by(Group) %>% summarise(total = sum(transcript.count),.groups = "drop")
+
+p2 <- ggplot(share, aes(x = Genes, y = Group)) +
+  geom_line(data = shared_transcript, aes(x = Genes, y = Group, group = Genes, linewidth = share.rate), 
+            color = "grey", alpha = 0.4) +
+  geom_point(aes(fill = transcript.count,size = transcript.count), shape = 21) +
+  theme_classic() +
+  labs(y = "Project", x = "Genes", size = "No. of transcripts", 
+       fill = "No. of transcripts", linewidth = "Shared transcripts rate") +
+  theme(
+   axis.line.x = element_blank(),    # Remove x-axis line
+   axis.text.x = element_blank(),   # Remove x-axis text
+   axis.ticks.x = element_blank()   # Remove x-axis ticks
+  )+
+  scale_fill_gradient(low = "#deebf7", high = "#3182bd")+
+  scale_size_continuous(breaks = seq(1, 7, by = 1), range = c(3, 5))+
+  scale_linewidth_continuous(breaks = c(0.66, 1), limits = c(0.66,1),range = c(1, 2))+
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 0,family = "Helvetica",color = "black"),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size = 12,family = "Helvetica",color = "black"),
+        legend.text = element_text(size = 13,family = "Helvetica",color = "black"),
+        legend.title = element_text(size = 13,family = "Helvetica",color = "black"))
+
+
+p3 <- ggplot(share.total, aes(x = total, y = Group)) +
+  geom_bar(stat = "identity", fill = "#9ecae1",width = 0.5) +   # 加 stat="identity"
+  theme_classic() +
+  scale_x_reverse(breaks = seq(0, 45, 10))+
+  scale_y_discrete(position = "right")+
+  labs(x = "No. of transcript")+
+  theme(axis.title.x = element_text(size = 8,family = "Helvetica",color = "black"),
+        axis.title.y = element_blank(),
+        axis.ticks.y = element_blank(),axis.line.y = element_blank(),
+        axis.text.x = element_text(size =6,family = "Helvetica",color = "black"),
+        axis.text.y =  element_blank())
+
+plot_spacer() + p1 + plot_layout(widths = c(1.05, 1.95)) 
+p3+ p2 + plot_layout(widths = c(1,2))
+```
+
+
+# Supplementary Dataset Table 3- Datasets for overlapping transcripts among compared Newborn Sequencing projects
+```{r}
+# Monogenic disease 
+
+# BabySeq
+babyseq <- read.xlsx("BabySeq monogenic diseases results.xlsx",sheetIndex = 1) %>% 
+  select(Genes, Variation, count) %>% 
+  mutate(Project = "BabySeq")
+
+# EarlyCheck
+early <- read.xlsx("EarlyCheck positive results.xlsx",sheetIndex = 4) %>% 
+  select(Genes, Variation, count) %>% unique() %>% 
+  mutate(Project = "NC NEXUS")
+
+# BabyDetect 
+detect <- read.xlsx("BabyDetect.xlsx",sheetIndex = 1) %>% 
+  mutate(Genotype = gsub("\\[","",Genotype), 
+                            Genotype = gsub("\\]","",Genotype),
+                            Genotype = gsub(";","-c.",Genotype),
+                            Genotype = gsub("–","-",Genotype)) %>% 
+  separate_rows(sep = "-", Genotype) %>% unique() %>% 
+  select(Case.no.,Gene,Genotype) %>% 
+  group_by(Gene, Genotype) %>% summarise(count= n(),.groups = "drop") %>%
+  mutate(Project = "BabyDetect") %>% 
+  rename(Variation = Genotype, Genes = Gene)
+
+# Guardian
+guardian1 <- guardian %>% select(Gene, Transcript) %>% 
+  left_join(., guardian.gene %>% select(Gene, True.positives) %>% rename(count = True.positives) ) %>% 
+  mutate(Project = "GUARDIAN")%>% 
+  rename(Variation = Transcript, Genes = Gene)
+
+# TR newborns
+child <- child_result %>% select(Genes, Variation, `No. of sample for variant`) %>% 
+  rename(count = `No. of sample for variant`) %>% 
+  mutate(Project = "Turkish newborns") 
+  
+all <- rbind(child, babyseq, early, detect,guardian1) %>% unique() %>% 
+  pivot_wider(names_from = Project, values_from = count, values_fill = list(count=0)) %>% 
+  mutate(GUARDIAN = if_else( GUARDIAN != 0, paste("Total positive cases of this gene: ", GUARDIAN), as.character(GUARDIAN)))
+write.xlsx(all,"Results_250216/Supplementary Dataset31.xlsx",sheetName = "Table 4",append = T)
+
+#Carrier status
+# BabySeq
+babyseq_car <- read.xlsx("BabySeq carrier status results.xlsx",sheetIndex = 1) %>% 
+  slice(-255,-256) %>% 
+  mutate(Variation = sapply(strsplit(split = "\n",Variation),`[`,1)) %>% 
+  mutate(Variation = sapply(strsplit(split = "\t",Variation),`[`,1)) %>% 
+  mutate(Variation = sapply(strsplit(split = " ",Variation),`[`,1)) %>% 
+  mutate(Variation = gsub("\\[","",Variation) ) %>% 
+  mutate(Variation = gsub("\\]","",Variation) ) %>% 
+  mutate(Variation = gsub(";",";c.",Variation) ) %>% 
+  separate_rows(sep = ";",Variation) %>% 
+  select(Genes, Variation, Number.of.cases) %>% 
+  group_by(Genes, Variation) %>% 
+  summarise(count = sum(Number.of.cases),.groups = "drop") %>% 
+  mutate(Project = "BabySeq")
+
+# EarlyCheck
+early_car <- read.xlsx("EarlyCheck positive results.xlsx",sheetIndex = 3) %>% 
+  rename(Variation = Transcript) %>% 
+  select(Genes, Variation, count) %>% unique() %>% 
+  mutate(Project = "NC NEXUS")
+
+# TR newborns
+carrier <- carrier_result %>% 
+  select(Genes, Variation,`No. of sample for variant`) %>% 
+  rename(count = `No. of sample for variant`) %>% 
+  mutate(Project = "Turkish newborns") 
+
+all_car <- rbind(carrier, babyseq_car, early_car) %>% unique() %>% 
+  mutate(count = as.numeric(count)) %>% 
+  mutate(Variation = gsub("\n","",Variation))  %>% 
+  pivot_wider(names_from = Project, values_from = count,values_fill = list(count = 0))
+
+```
+
+
+# 13. Figure 3B
+```{r}
+ontology <- read.csv("Genedb1213_ontology.txt",header = T,sep = "\t")
+
+# Pie chart 
+# For Childhood onset diseases 
+on.child <- child_result %>% 
+  separate_rows(sep = "; ",Disease) %>% 
+  left_join(., unique(ontology[,c("Disease","Genes","Disorder_Group")]),
+            by = c("Disease","Genes")) %>% 
+  separate_rows(Disorder_Group,sep = ";") %>% 
+  select(Disease, Disorder_Group) %>% unique() %>% 
+  group_by(Disorder_Group) %>% 
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>% 
+  mutate(ratio = count / sum(count)) %>% 
+  mutate(
+    percent = paste0(round(ratio * 100, 1), "%"),  
+    cum_ratio = cumsum(ratio) - ratio / 2          
+  ) %>% as.data.frame() %>% mutate(ratio = as.numeric(ratio))
+
+# For Carrier status
+on.carrier<- carrier_result %>% 
+  separate_rows(sep = "; ",Disease) %>% 
+  left_join(., unique(ontology[,c("Disease","Genes","Disorder_Group")]),
+            by = c("Disease","Genes")) %>% 
+  select(Disease, Disorder_Group) %>% unique() %>% 
+  mutate(Disorder_Group = if_else(grepl(";",Disorder_Group),"Complex genetic syndromes",Disorder_Group)) %>% unique() %>% 
+ group_by(Disorder_Group) %>% 
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>% 
+  mutate(ratio = count / sum(count)) %>% 
+  mutate(
+    percent = paste0(round(ratio * 100, 1), "%"),  
+    cum_ratio = cumsum(ratio) - ratio / 2 
+  ) %>% as.data.frame() %>% mutate(ratio = as.numeric(ratio))
+# Add SMA into on.carrier 
+org.count <- on.carrier[which(on.carrier$Disorder_Group == "Neuromuscular and musculoskelettal disorders"),"count"]
+on.carrier[which(on.carrier$new.disease.group.2 == "Neuromuscular and musculoskelettal disorders"),"count"] <- org.count + 1
+
+on.all <- rbind(on.child %>% mutate(group = "child"), on.carrier %>% mutate(group = "carrier")) %>% 
+  select(Disorder_Group, count, group) %>% 
+  as.data.frame()  %>% 
+  mutate(count = log(count), 
+         count = if_else(count == 0, 0.1, count)) # change count = 1 to 0.1, since log(1)=0
+
+wide_data <- on.all %>%
+  pivot_wider(
+    names_from = Disorder_Group,
+    values_from = count,
+    values_fill = 0
+  ) %>%
+  as.data.frame()
+
+child_data <- wide_data %>% filter(group == "child") %>% select(-group)
+carrier_data <- wide_data %>% filter(group == "carrier") %>% select(-group)
+
+plot_data <- rbind(
+  rep(5, ncol(child_data)), 
+  rep(0, ncol(child_data)), 
+  carrier_data,
+  child_data
+)
+
+colors <- c(rgb(0.541, 0.549, 0.749, 0.5), rgb(0.88, 0.44, 0.4,0.7)) # carrier, child
+lines <- c( rgb(0.541, 0.549, 0.749, 1), rgb(0.88, 0.44, 0.4,1))
+
+library(fmsb)
+
+radarchart(
+  plot_data,
+  axistype = 0,
+  pcol = lines,        
+  pfcol = colors,       
+  plwd = 2,              
+  plty = 1,           
+  cglcol = "darkgrey",      
+  cglty = 1,      
+  cglwd = 0.5,          
+  axislabcol = "black",   
+  vlcex = 0.01,
+  title = "Disease Groups of Child-onset and Carrier status"
+)
+
+```
+
+# Supplementary Dataset Table 1
+```{r}
+sep <- genedb %>% 
+  mutate(BabySeq = case_when(grepl("BabySeq_A",Mark) ~ "Group A",
+                             grepl("BabySeq_B",Mark) ~ "Group B", TRUE ~ ""),
+         `NC NEXUS` =  case_when(grepl("EarlyCheck_1",Mark) ~ "Group 1",
+                             grepl("EarlyCheck_2",Mark) ~ "Group 2", 
+                             grepl("EarlyCheck_3",Mark) ~ "Group 3",
+                             grepl("EarlyCheck_4",Mark) ~ "Group 4",
+                             TRUE ~ ""),
+         BeginNGS =  case_when(grepl("rWGS_A",Mark) ~ "Group A",
+                             grepl("rWGS_B",Mark) ~ "Group B", TRUE ~ ""),
+         Genomic101 = case_when(grepl("Genomic101",Mark) ~ "Yes", TRUE ~ ""),
+         Commercial =  case_when(grepl("Nurture",Mark) ~ "Yes",TRUE ~ ""),
+         ACMG =  case_when(grepl("ACMG",Mark) ~ "Yes", TRUE ~ ""),
+         Inhouse =  case_when(grepl("Inhouse",Mark) ~ "Yes",TRUE ~ "")) %>% 
+  select(-Mark) %>% 
+  filter(Inheritance != "Unknown")
+cligene <- read.xlsx("Supplementary Dataset1.xlsx",sheetIndex = 2)
+
+sep1 <- sep %>% 
+  left_join(., cligene %>% select(Genes, Disease, SZAdiseaseID, ClinGen.Classification), by = c("Genes","Disease","SZAdiseaseID")) %>% unique()
+index <- which(is.na(sep1$ClinGen.Classification))
+sep1$ClinGen.Classification[index] <- "Not defined"
+which(is.na(sep1$ClinGen.Classification))
+```
+
