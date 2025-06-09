@@ -2,11 +2,11 @@ conda activate vep
 
 zgrep -E "^#|PASS" sample.vcf.gz | bgzip > sample_PASS.vcf.gz 
 
-echo "vep cache: 113, vep version: 113."
+echo "vep cache: 112, vep version: 112."
 
 vep --cache -dir_cache vep_cache \
 --offline \
---cache_version 113 \
+--cache_version 112 \
 --fork 48 \
 --format vcf \
 --dir_plugins vep_cache/VEP_plugins \
