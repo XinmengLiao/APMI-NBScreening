@@ -1,0 +1,336 @@
+---
+title: "UKBB.pvcf"
+author: "Xinmeng Liao"
+date: "2025-06-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(xlsx)
+library(tidyr)
+library(stringr)
+```
+
+# 1. Merge gender and manually curated disease with ICD10
+```{r}
+curated.disease <- read.xlsx("snp.disease.icd10.curated.xlsx",sheetIndex = 1,header = T) %>% select(1:2)
+curated.disease <- curated.disease %>% 
+  separate_rows(sep = ",",ICD10) %>% 
+  mutate(Group = sapply(strsplit(split = "\\.",ICD10),`[`,1))
+
+snp.all <- read.csv("all.snp20250327.txt",header = T,sep = "\t")
+
+snp.all1 <- snp.all %>% left_join(., `curated.disease`, by = c("Disease"))
+which(is.na(snp.all1$Group))
+
+snp.all2 <- snp.all1 %>% 
+  filter(Inheritance != "Unknown") %>% 
+  filter(Target.group == "Newborn-screening") %>% 
+  mutate(`Aa.sample` = if_else(Inheritance == "AR","",`Aa.sample`)) %>% 
+  filter(!(`Aa.sample` == "" & `aa.sample` == ""))%>% unique() %>% 
+  mutate(Aa.sample = str_replace_all(Aa.sample, "(\\d+)", "Aa\\1")) %>% 
+  mutate(aa.sample = str_replace_all(aa.sample, "(\\d+)", "aa\\1")) %>% 
+  mutate(sample = paste(Aa.sample, aa.sample,sep = ",")) %>% 
+  select(-Aa.sample, -aa.num,-aa.sample,-Aa.num,-Aa,-aa,-AA,-AA.num) %>% 
+  separate_rows(sep = ",",sample) %>% 
+  filter(sample != "") %>% 
+  filter(sample != "NA") %>% 
+  mutate(genotype = case_when(grepl("Aa",sample) ~ "Aa",
+                              grepl("aa",sample) ~ "aa", TRUE ~ NA))
+unique(snp.all2$genotype) # should not have NA
+
+gender <- read.csv("metadata/gender.txt",header = T,sep = "\t") %>% mutate(participant.eid = as.character(participant.eid))
+snp.all2 <- snp.all2 %>% 
+  mutate(sample = gsub("^[A-Za-z]+","", sample),
+         number = 1) %>% unique() %>% 
+  left_join(., gender, by = c("sample" = "participant.eid")) %>% 
+  filter(!(Inheritance == "AR" & genotype == "Aa") & 
+         !(Inheritance == "XLR" & genotype == "Aa" & Sex ==  "Female"))
+```
+
+
+# 2. Count the positive numbers (before root cause analysis)
+```{r}
+# How many persons are positive originally
+which(is.na(snp.all2$sample))
+which(snp.all2$sample== "")
+length(unique(snp.all2$sample)) # 48064
+length(unique(snp.all2$variant_info)) # 2653
+length(unique(snp.all2$Genes)) # 354
+length(unique(snp.all2$Disease)) # 456 
+positive.rate.before <- length(unique(snp.all2$sample)) / 490541
+positive.rate.before
+# 0.09798162
+specificity.before = 1 - positive.rate.before 
+specificity.before
+# 0.9020184
+
+result_file <-  snp.all2 %>% 
+  group_by(Genes, Disease,Inheritance) %>% 
+  summarise(`UKBB positives` = n_distinct(variant_info),
+            `No. of UKBB positives subjects` = n_distinct(sample),
+            .groups = "drop") 
+```
+
+# 3. Curation 1: Remove synonymous variants
+```{r}
+snp.all.remove.syn <- snp.all2  %>% 
+  filter(Consequence != "synonymous_variant") %>% unique()
+
+length(setdiff(unique(snp.all2$sample),unique(snp.all.remove.syn$sample))) # 35
+length(setdiff(unique(snp.all2$variant_info),unique(snp.all.remove.syn$variant_info))) # 10
+
+result.after.remove.syn <- snp.all2 %>% 
+  filter(Consequence == "synonymous_variant") %>% unique() %>% 
+  group_by(Genes, Disease,Inheritance) %>% 
+  summarise(`No. of removed synonymous variants` = n_distinct(variant_info),
+            `No. of removed subjects with synonymous variants` = n_distinct(sample),
+            .groups = "drop")
+result_file <- result_file %>% 
+  left_join(.,  result.after.remove.syn, by = c("Genes","Disease","Inheritance"))
+
+```
+
+# 4. Curation 2: Remove variants that hard to detect by short-read sequencing tech
+```{r}
+hard_detected_gene <- c('CBS','DCLRE1C','FCGR2B','FLG','FXN','GTF2IRD2','HYDIN','NCF1','NLRP7','PKD1','RHCE1','RHCE2','TNXA','TNXB','C4A','C4B','DMBT1','STRC','HSPG2','CYP2D6','CYP21A','PMS2')
+# all variants on these hard detected genes
+remove_hard_gene <- snp.all.remove.syn %>% 
+  filter(Genes %in% hard_detected_gene)
+unique(remove_hard_gene$Genes) # "PMS2" "STRC" "PKD1" "CBS"
+
+snp.all.remove.hard <- snp.all.remove.syn %>% 
+  filter(!(Genes %in% hard_detected_gene))
+
+length(setdiff(unique(snp.all2$sample),unique(snp.all.remove.hard$sample))) # 1342
+length(setdiff(unique(snp.all2$variant_info),unique(snp.all.remove.hard$variant_info))) # 80
+
+result.after.remove.hard.gene <- snp.all.remove.syn %>% 
+  filter((Genes %in% hard_detected_gene)) %>% unique() %>% 
+  group_by(Genes, Disease,Inheritance) %>% 
+  summarise(`No. of removed variants challenging with short-read sequencing` = n_distinct(variant_info),
+            `No. of removed subjects with variants challenging with short-read sequencing` = n_distinct(sample),
+            .groups = "drop")
+result_file <- result_file %>% 
+  left_join(.,  result.after.remove.hard.gene, by = c("Genes","Disease","Inheritance"))
+
+```
+
+
+# 5. Curation 3: Multiple inh patterns variants
+```{r}
+# Disease with multiple inheritance patterns are manually curated by searching ClinVar and other publications
+multi <- read.xlsx("SNP_data/multi.inh.curated.xlsx",sheetIndex = 1) %>% unique() %>% 
+  select(variant_info, Inheritance, Disease, Decision, Reason) %>% unique()
+snp.all3 <- snp.all.remove.hard %>% 
+  left_join(., multi, by = c("variant_info","Inheritance","Disease") )
+
+multi.remove <- snp.all3 %>%
+  filter(is.na(Decision) | !(
+         (Decision == "Remove Aa.sample" & genotype == "Aa") |
+         (Decision == "Remove Aa.female sample, keep male sample" & Sex == "Female" & genotype == "Aa") |
+         (Decision == "Remove") ))
+
+length(setdiff(unique(snp.all3$sample),unique(multi.remove$sample))) # 3074
+length(setdiff(unique(snp.all3$variant_info),unique(multi.remove$variant_info))) # 129
+
+result.after.remove.multi <- snp.all3 %>% 
+  filter(!is.na(Decision) & (
+         (Decision == "Remove Aa.sample" & genotype == "Aa") |
+         (Decision == "Remove Aa.female sample, keep male sample" & Sex == "Female" & genotype == "Aa") |
+         (Decision == "Remove") )) %>% unique() %>% 
+  group_by(Genes, Disease,Inheritance) %>% 
+  summarise(`No. of removed variants with wrong inheritance modes` = n_distinct(variant_info),
+            `No. of removed subjects due to variants with wrong inheritance modes` = n_distinct(sample),
+            .groups = "drop")
+result_file <- result_file %>% 
+  left_join(.,  result.after.remove.multi, by = c("Genes","Disease","Inheritance"))
+```
+
+# 6. Curation 4: Sample ICD10 and GeneDB-ICD 10 are not matched
+```{r}
+icd10 <- read.csv("ICD10.tsv",header = T,sep = "\t")
+diagnoses.icd10 <- read.csv("diagnoses.death.all20250327.txt",header = T,sep = ",")
+cols <- colnames(diagnoses.icd10)[2:ncol(diagnoses.icd10)] 
+diagnoses.icd10 <- diagnoses.icd10 %>%
+  mutate(across(all_of(cols), ~ gsub('\\[|\\]|"', "", .))) %>%
+  tidyr::unite("combined_icd10", all_of(cols), sep = ",", na.rm = TRUE) %>% 
+  separate_rows(sep = ",",combined_icd10) %>% 
+  filter(combined_icd10 != "") %>% 
+  left_join(., icd10, by = c("combined_icd10" = "coding")) %>% select(1:3) %>% 
+  mutate(participant.eid = as.character(participant.eid))
+ 
+snp.all4 <- multi.remove %>% 
+  left_join(., diagnoses.icd10, by = c("sample" = "participant.eid")) %>% 
+  rename(Diagnosis.ID = combined_icd10, Diagnosis.name = meaning) %>% 
+  mutate(High.diagnosis.group = sub("^([A-Za-z]\\d{2}).*", "\\1", Diagnosis.ID)) %>% 
+  unique()
+
+ukbb.positive.remove <- snp.all4 %>% 
+  group_by(sample, Disease) %>% 
+  mutate(to_remove = any(Group == High.diagnosis.group | ICD10 == Diagnosis.ID)) %>%
+  filter(!to_remove) %>% 
+  ungroup() %>% unique()
+
+# count how many samples and variants are removed in the 
+length(setdiff(unique(snp.all4$sample), unique(ukbb.positive.remove$sample))) # 5878 samples
+length(setdiff(unique(snp.all4$variant_info), unique(ukbb.positive.remove$variant_info))) # 364 variants
+
+result.after.remove.true <- snp.all4 %>% 
+  group_by(sample, Disease) %>% 
+  mutate(to_remove = any(Group == High.diagnosis.group | ICD10 == Diagnosis.ID)) %>%
+  filter(to_remove) %>% 
+  ungroup() %>% unique() %>% 
+  group_by(Genes, Disease,Inheritance) %>% 
+  summarise(`No. of removed variants of UKBB likely true positives` = n_distinct(variant_info),
+            `No. of removed subjects due to variants of UKBB likely true positives` = n_distinct(sample),
+            .groups = "drop")
+result_file <- result_file %>% 
+  left_join(.,  result.after.remove.true, by = c("Genes","Disease","Inheritance"))
+
+```
+
+# 7. count the positive numbers (after root cause analysis) 
+```{r}
+length(unique(ukbb.positive.remove$sample)) #37770
+positive.rate.after <- length(unique(ukbb.positive.remove$sample)) / 490541
+positive.rate.after 
+# 0.07699662
+specificity.after = 1 - positive.rate.after
+specificity.after
+# 0.9230034
+(length(unique(snp.all2$sample)) - length(unique(ukbb.positive.remove$sample))) / length(unique(snp.all2$sample))
+# 0.2141728
+
+variant.remove.ukbb <- c(setdiff(unique(snp.all2$variant_info),unique(snp.all.remove.hard$variant_info)),
+                         setdiff(unique(snp.all.remove.hard$variant_info),unique(snp.all.remove.syn$variant_info)),
+                         setdiff(unique(snp.all3$variant_info),unique(multi.remove$variant_info)),
+                         setdiff(unique(snp.all4$variant_info), unique(ukbb.positive.remove$variant_info))) %>% unique()
+```
+
+# 8. Verify with rWGS data 
+```{r}
+#PSAT1 and PKLR are removed since wrong diplotypes and inh, 73 genes remained 
+rWGS <- c('RYR1','BTD','G6PD','CYP21A2','F8','OTC','NR5A1','PHEX','CFTR','SCN1A','HNF1A','ACVRL1','HNF4A','CFB','PAH','CBS','DMD','SLC16A1','GAA','F9','KCNQ2','SCN2A','ELANE','ALDOB','IL2RG','ABCC6','KCNT1','SCN8A','SLC2A1','BTK','CACNA1C','TSC1','DKC1','SBDS','TSC2','FANCC','NR3C2','C6','CFP','CUBN','SH2D1A','ALPL','ASL','C9','FOXP3','POR','SLC22A5','FANCB','HBA2','MYO9A','SCN3A','ACADM','CDKN1C','GALT','GCDH','IDUA','LIPA','XIAP','ASS1','AVPR2','CACNA1D','CHRNE','COLQ','CSF3R','CTPS1','ETFDH','FANCA','GLRB','MC2R','MCCC2','SI','TCF3','TH')
+
+clinvar.variant <- read.csv("clinvar.filtration3.csv",header = T,sep = "\t") %>% 
+  filter(is.na(MAX_AF) | MAX_AF < 0.005) %>% 
+  filter(grepl("rWGS",Mark)) %>% 
+  mutate(chr = paste0("chr",chr)) %>% 
+  mutate(variant_info = paste(chr, pos, ref,alt,sep = "_")) %>% 
+  select(Consequence, variant_info, Genes, Disease, Inheritance, Mark, MIM, Target.group,ClinVar_CLNSIG,ClinVar_CLNREVSTAT, acmg_classification,ClinVar) %>% 
+  filter(Target.group == "Newborn-screening" & Inheritance != "Unknown") %>% 
+  filter(Genes %in% rWGS)
+
+
+# All data sets preparation
+curated.disease <- read.xlsx("snp.disease.icd10.curated.xlsx",sheetIndex = 1,header = T) %>% select(1:2)
+curated.disease <- curated.disease %>% 
+  separate_rows(sep = ",",ICD10) %>% 
+  mutate(Group = sapply(strsplit(split = "\\.",ICD10),`[`,1))
+multi <- read.xlsx("multi.inh.curated.xlsx",sheetIndex = 1) %>%
+  select(variant_info, Inheritance, Disease, Decision, Reason) %>% unique()
+icd10 <- read.csv("ICD10.tsv",header = T,sep = "\t")
+diagnoses.icd10 <- read.csv("diagnoses.death.all20250327.txt",header = T,sep = ",")
+cols <- colnames(diagnoses.icd10)[2:ncol(diagnoses.icd10)] 
+diagnoses.icd10 <- diagnoses.icd10 %>%
+  mutate(across(all_of(cols), ~ gsub('\\[|\\]|"', "", .))) %>% 
+  unite("combined_icd10", all_of(cols), sep = ",", na.rm = TRUE) %>% 
+  separate_rows(sep = ",",combined_icd10) %>% 
+  filter(combined_icd10 != "") %>% 
+  left_join(., icd10, by = c("combined_icd10" = "coding")) %>% select(1:3) %>% 
+  mutate(participant.eid = as.character(participant.eid))
+hard_detected_gene <- c('CBS')
+gender <- read.csv("gender.txt",header = T,sep = "\t") %>% mutate(participant.eid = as.character(participant.eid))
+
+
+snp.all1 <- snp.all %>% left_join(., `curated.disease`, by = c("Disease"))
+which(is.na(snp.all1$Group))
+
+snp.all1 <- snp.all1 %>% 
+  filter(Inheritance != "Unknown") %>% 
+  filter(Target.group == "Newborn-screening") %>% 
+  mutate(`Aa.sample` = if_else(Inheritance == "AR","",`Aa.sample`)) %>% 
+  filter(!(`Aa.sample` == "" & `aa.sample` == ""))%>% unique()
+which(snp.all1$aa.sample == 0 & snp.all1$Aa.num == 0)
+
+snp.all2 <- snp.all1 %>% 
+  mutate(Aa.sample = str_replace_all(Aa.sample, "(\\d+)", "Aa\\1")) %>% 
+  mutate(aa.sample = str_replace_all(aa.sample, "(\\d+)", "aa\\1")) %>% 
+  mutate(sample = paste(Aa.sample, aa.sample,sep = ",")) %>% 
+  select(-Aa.sample, -aa.num,-aa.sample,-Aa.num,-Aa,-aa,-AA,-AA.num) %>% 
+  separate_rows(sep = ",",sample) %>% 
+  filter(sample != "") %>% 
+  filter(sample != "NA") %>% 
+  mutate(genotype = case_when(grepl("Aa",sample) ~ "Aa",
+                              grepl("aa",sample) ~ "aa", TRUE ~ NA))
+unique(snp.all2$genotype) # should not have NA
+length(unique(snp.all2$sample))
+
+snp.all2 <- snp.all2 %>% 
+  mutate(sample = gsub("^[A-Za-z]+","", sample),
+         number = 1) %>% unique() %>% 
+  left_join(., gender, by = c("sample" = "participant.eid")) %>% 
+  filter(!(Inheritance == "AR" & genotype == "Aa") & 
+         !(Inheritance == "XLR" & genotype == "Aa" & Sex ==  "Female"))
+
+# How many persons are positive originally
+which(is.na(snp.all2$sample))
+which(snp.all2$sample== "")
+length(unique(snp.all2$sample)) # 3762
+length(unique(snp.all2$variant_info)) # 293
+length(unique(snp.all2$Genes)) # 36
+positive.rate.before <- length(unique(snp.all2$sample)) / 490541
+positive.rate.before
+# 0.007669084
+specificity.before = 1 - positive.rate.before
+specificity.before
+# 0.9923309
+
+# 1. Remove CBS
+snp.all3 <- snp.all2 %>% 
+  filter(!(Genes %in% hard_detected_gene))
+length(setdiff(unique(snp.all2$sample), unique(snp.all3$sample))) # 959
+length(setdiff(unique(snp.all2$variant_info), unique(snp.all3$variant_info))) # 27
+
+# 2. Remove synonymous variants
+snp.all4 <- snp.all3 %>% 
+  filter(!Consequence %in% c("synonymous_variant","intron_variant","intergenic_variant")) %>%
+  unique() 
+length(setdiff(unique(snp.all3$sample), unique(snp.all4$sample))) # 959
+length(setdiff(unique(snp.all3$variant_info), unique(snp.all4$variant_info))) # 27
+
+# 3. Correct the multiple inheritance modes
+snp.all5 <- snp.all4 %>% 
+  left_join(., multi, by = c("variant_info","Inheritance","Disease") ) %>% 
+  filter(is.na(Decision) | !(
+         (Decision == "Remove Aa.sample" & genotype == "Aa") |
+         (Decision == "Remove Aa.female sample, keep male sample" & Sex == "Female" & genotype == "Aa") |
+         (Decision == "Remove") )) %>% unique()
+length(setdiff(unique(snp.all4$sample), unique(snp.all5$sample))) # 1415
+length(setdiff(unique(snp.all4$variant_info), unique(snp.all5$variant_info))) # 46
+
+# 4. Correct the sample disease and ICD10 
+snp.all6 <- snp.all5 %>% 
+  left_join(., diagnoses.icd10, by = c("sample" = "participant.eid")) %>% 
+  rename(Diagnosis.ID = combined_icd10, Diagnosis.name = meaning) %>% 
+  mutate(High.diagnosis.group = sub("^([A-Za-z]\\d{2}).*", "\\1", Diagnosis.ID)) %>% 
+  unique() %>% 
+  group_by(sample, Disease) %>% 
+  mutate(to_remove = any(Group == High.diagnosis.group | ICD10 == Diagnosis.ID)) %>%
+  filter(!to_remove) %>% 
+  ungroup() %>% unique()
+
+length(unique(snp.all6$sample)) # 1205
+length(setdiff(unique(snp.all5$sample), unique(snp.all6$sample))) # 182
+positive.rate.after <- length(unique(snp.all6$sample)) / 490541
+positive.rate.after 
+# 0.002456472
+(length(unique(snp.all2$sample)) - length(unique(snp.all3$sample))) / length(unique(snp.all2$sample))
+# 0.6796917
+specificity.after = 1 - positive.rate.after 
+specificity.after
+# 0.9975435
+```
+
