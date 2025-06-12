@@ -3,5 +3,5 @@ NBScreening is the WGS-based newborn screening project of Anatolian Precision Me
 <p align="center">
   <img src="https://github.com/XinmengLiao/APMI-NBScreening/raw/main/images/Workflow.jpg" 
        alt="Workflow" 
-       width="60%">
+       width="80%">
 </p>
