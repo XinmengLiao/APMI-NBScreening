@@ -331,7 +331,7 @@ newborn_rare_hom <- newborn_hclof_all %>% filter(AF <= 0.01)
 
 ```
 
-# Supplementary Figure 1A=B
+# Supplementary Figure 1A and 1B
 ```{r}
 library(VennDiagram)
 library(RColorBrewer)
